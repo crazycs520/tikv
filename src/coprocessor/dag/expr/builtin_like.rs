@@ -26,8 +26,13 @@ impl ScalarFunc {
     /// otherwise MySQL will compare decoded string.
     pub fn like(&self, ctx: &mut EvalContext, row: &[Datum]) -> Result<Option<i64>> {
         let target = try_opt!(self.children[0].eval_string(ctx, row));
-        let pattern = try_opt!(self.children[1].eval_string(ctx, row));
+        let pattern = try_opt!(self.children[1].eval_string_and_decode(ctx, row)).into_owned();
         let escape = try_opt!(self.children[2].eval_int(ctx, row)) as u32;
+        let pattern = if ctx.cfg.lower_case_table_names != 0 {
+            pattern.to_lowercase().into_bytes()
+        } else {
+            pattern.into_bytes()
+        };
         Ok(Some(like(&target, &pattern, escape, 0)? as i64))
     }
 

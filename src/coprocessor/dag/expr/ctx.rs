@@ -66,6 +66,8 @@ pub struct EvalConfig {
     pub sql_mode: u64,
     /// if the session is in strict mode.
     pub strict_sql_mode: bool,
+    pub lower_case_table_names: u64
+
 }
 
 impl Default for EvalConfig {
@@ -89,6 +91,7 @@ impl EvalConfig {
             max_warning_cnt: DEFAULT_MAX_WARNING_CNT,
             sql_mode: 0,
             strict_sql_mode: false,
+            lower_case_table_names: 0,
         }
     }
 
@@ -161,6 +164,11 @@ impl EvalConfig {
             }
             None => Err(Error::invalid_timezone(tz_name)),
         }
+    }
+
+    pub fn set_lower_case_table_names(&mut self, lct_names: u64) -> &mut Self {
+        self.lower_case_table_names = lct_names;
+        self
     }
 
     pub fn set_time_zone_by_offset(&mut self, offset_sec: i64) -> Result<&mut Self> {

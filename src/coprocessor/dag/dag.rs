@@ -48,6 +48,9 @@ impl DAGContext {
             // This should not be reachable. However we will not panic here in case
             // of compatibility issues.
         }
+        if req.has_lower_case_table_names() {
+            eval_cfg.set_lower_case_table_names(req.get_lower_case_table_names());
+        }
         if req.has_max_warning_count() {
             eval_cfg.set_max_warning_cnt(req.get_max_warning_count() as usize);
         }
