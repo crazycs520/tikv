@@ -2,6 +2,7 @@
 
 pub mod aggr_executor;
 pub mod hash_aggr_helper;
+pub mod mem_scan_executor;
 #[cfg(test)]
 pub mod mock_executor;
 pub mod scan_executor;

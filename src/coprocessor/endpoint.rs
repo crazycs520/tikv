@@ -115,12 +115,14 @@ impl<E: Engine> Endpoint<E> {
                 let mut table_scan = false;
                 let mut is_desc_scan = false;
                 if let Some(scan) = dag.get_executors().iter().next() {
+                    let mem_scan = scan.get_tp() == ExecType::TypeMemTableScan;
                     table_scan = scan.get_tp() == ExecType::TypeTableScan;
                     if table_scan {
                         is_desc_scan = scan.get_tbl_scan().get_desc();
                     } else {
                         is_desc_scan = scan.get_idx_scan().get_desc();
                     }
+                    table_scan |= mem_scan;
                 }
                 req_ctx = ReqContext::new(
                     make_tag(table_scan),

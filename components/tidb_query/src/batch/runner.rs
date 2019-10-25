@@ -71,6 +71,11 @@ impl BatchExecutorsRunner<()> {
                     BatchIndexScanExecutor::check_supported(&descriptor)
                         .map_err(|e| other_err!("BatchIndexScanExecutor: {}", e))?;
                 }
+                ExecType::TypeMemTableScan => {
+                    let descriptor = ed.get_mem_tbl_scan();
+                    BatchMemTableScan::check_supported(&descriptor)
+                        .map_err(|e| other_err!("BatchMemTableScan: {}", e))?
+                }
                 ExecType::TypeSelection => {
                     let descriptor = ed.get_selection();
                     BatchSelectionExecutor::check_supported(&descriptor)
@@ -161,6 +166,18 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
                     descriptor.get_unique(),
                 )?
                 .with_summary_collector(C::new(summary_slot_index)),
+            );
+        }
+        ExecType::TypeMemTableScan => {
+            COPR_EXECUTOR_COUNT
+                .with_label_values(&["batch_mem_table_scan"])
+                .inc();
+
+            let mut descriptor = first_ed.take_mem_tbl_scan();
+            let columns_info = descriptor.take_columns().into();
+            executor = Box::new(
+                BatchMemTableScan::<S>::new(config.clone(), columns_info)?
+                    .with_summary_collector(C::new(summary_slot_index)),
             );
         }
         _ => {
