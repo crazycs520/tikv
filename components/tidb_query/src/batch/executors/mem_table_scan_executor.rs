@@ -19,7 +19,6 @@ pub struct BatchMemTableScan<S: Storage> {
     context: EvalContext,
     schema: Vec<FieldType>,
     phantom: PhantomData<S>,
-    //TODO: add field: column_id_index: HashMap<i64, usize>,
 }
 
 impl BatchMemTableScan<Box<dyn Storage<Statistics = ()>>> {
@@ -65,7 +64,6 @@ impl<S: Storage> MemScanExecutor for BatchMemTableScan<S> {
         let mut system = sysinfo::System::new();
         system.refresh_all();
 
-        assert_eq!(columns.columns_len(), 6);
         let processor_list = system.get_processor_list();
         let cpu_usage = processor_list
             .iter()
@@ -84,6 +82,7 @@ impl<S: Storage> MemScanExecutor for BatchMemTableScan<S> {
             Datum::U64(total_memory),
             Datum::U64(used_memory),
         ];
+        assert_eq!(columns.columns_len(), datums.len());
 
         let mut value = Vec::new();
         value.write_datum(&datums, false)?;
@@ -108,7 +107,8 @@ impl<S: Storage> BatchExecutor for BatchMemTableScan<S> {
 
     fn next_batch(&mut self, _: usize) -> BatchExecuteResult {
         let mut columns = self.build_column_vec(1);
-        self.process_row(&mut columns).unwrap();
+        let is_drain = self.process_row(&mut columns);
+        columns.truncate_into_equal_length();
 
         let logical_rows = (0..columns.rows_len()).collect();
         BatchExecuteResult {

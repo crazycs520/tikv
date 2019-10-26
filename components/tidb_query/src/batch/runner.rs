@@ -117,7 +117,7 @@ impl BatchExecutorsRunner<()> {
 
 pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
     executor_descriptors: Vec<tipb::Executor>,
-    storage: S,
+    storage: Option<S>,
     ranges: Vec<KeyRange>,
     config: Arc<EvalConfig>,
 ) -> Result<Box<dyn BatchExecutor<StorageStats = S::Statistics>>> {
@@ -140,7 +140,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
             let columns_info = descriptor.take_columns().into();
             executor = Box::new(
                 BatchTableScanExecutor::new(
-                    storage,
+                    storage.unwrap(),
                     config.clone(),
                     columns_info,
                     ranges,
@@ -158,7 +158,7 @@ pub fn build_executors<S: Storage + 'static, C: ExecSummaryCollector + 'static>(
             let columns_info = descriptor.take_columns().into();
             executor = Box::new(
                 BatchIndexScanExecutor::new(
-                    storage,
+                    storage.unwrap(),
                     config.clone(),
                     columns_info,
                     ranges,
@@ -321,7 +321,7 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
     pub fn from_request<S: Storage<Statistics = SS> + 'static>(
         mut req: DagRequest,
         ranges: Vec<KeyRange>,
-        storage: S,
+        storage: Option<S>,
         deadline: Deadline,
     ) -> Result<Self> {
         let executors_len = req.get_executors().len();

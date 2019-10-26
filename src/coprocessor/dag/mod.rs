@@ -16,7 +16,7 @@ use crate::storage::{Statistics, Store};
 pub fn build_handler<S: Store + 'static>(
     req: DagRequest,
     ranges: Vec<KeyRange>,
-    store: S,
+    store: Option<S>,
     deadline: Deadline,
     batch_row_limit: usize,
     is_streaming: bool,
@@ -40,10 +40,15 @@ pub fn build_handler<S: Store + 'static>(
         Ok(BatchDAGHandler::new(req, ranges, store, deadline)?.into_boxed())
     } else {
         COPR_DAG_REQ_COUNT.with_label_values(&["normal"]).inc();
-        Ok(
-            DAGHandler::new(req, ranges, store, deadline, batch_row_limit, is_streaming)?
-                .into_boxed(),
-        )
+        Ok(DAGHandler::new(
+            req,
+            ranges,
+            store.unwrap(),
+            deadline,
+            batch_row_limit,
+            is_streaming,
+        )?
+        .into_boxed())
     }
 }
 
@@ -89,14 +94,14 @@ impl BatchDAGHandler {
     pub fn new<S: Store + 'static>(
         req: DagRequest,
         ranges: Vec<KeyRange>,
-        store: S,
+        store: Option<S>,
         deadline: Deadline,
     ) -> Result<Self> {
         Ok(Self(
             tidb_query::batch::runner::BatchExecutorsRunner::from_request(
                 req,
                 ranges,
-                TiKVStorage::from(store),
+                store.map(TiKVStorage::from),
                 deadline,
             )?,
         ))
