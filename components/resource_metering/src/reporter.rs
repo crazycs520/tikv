@@ -165,6 +165,10 @@ impl Runnable for ResourceMeteringReporter {
                                 .insert(tag.clone(), ReportRecord::new(timestamp_secs, record));
                         }
                     }
+                    println!(
+                        "collector record, cpu_time: {}, scan_row: {}",
+                        record.cpu_time_ms, record.scan_rows
+                    );
                 }
 
                 if self.records.len() > self.config.max_resource_groups {
@@ -194,7 +198,7 @@ impl Runnable for ResourceMeteringReporter {
                                 .for_each(|(secs, (cpu_time, scan_rows))| {
                                     (*others)
                                         .entry(secs)
-                                        .or_insert(Record::new())
+                                        .or_insert(Record::default())
                                         .merge(cpu_time, scan_rows)
                                 })
                         });

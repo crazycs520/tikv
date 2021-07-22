@@ -3,7 +3,7 @@
 use crate::ResourceMeteringTag;
 
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -88,21 +88,43 @@ impl Default for CpuRecords {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Record {
     pub cpu_time_ms: u32,
     pub scan_rows: u64,
 }
 
 impl Record {
-    pub fn new() -> Self {
-        return Self {
-            cpu_time_ms: 0,
-            scan_rows: 0,
-        };
-    }
     pub fn merge(&mut self, cpu_time_ms: u32, scan_rows: u64) {
         self.cpu_time_ms += cpu_time_ms;
         self.scan_rows += scan_rows;
+    }
+}
+
+pub struct LocalReqRowStatistics {
+    scan_row_count: AtomicU64,
+}
+
+impl LocalReqRowStatistics {
+    fn new() -> Self {
+        Self {
+            scan_row_count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn add_scan_row_count(&self, count: u64) {
+        self.scan_row_count.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn get_scan_row_count(&self) -> u64 {
+        self.scan_row_count.fetch_or(0, Ordering::Relaxed)
+    }
+}
+
+pub struct ThreadLocalReq;
+
+impl ThreadLocalReq {
+    thread_local! {
+        pub static LOCAL_REQ_SCAN_ROW_STATISTICS: Arc<LocalReqRowStatistics> = Arc::new(LocalReqRowStatistics::new());
     }
 }

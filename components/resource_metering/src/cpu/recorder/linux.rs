@@ -2,14 +2,14 @@
 
 use crate::cpu::collector::{Collector, CollectorId};
 use crate::cpu::collector::{CollectorRegistrationMsg, COLLECTOR_REGISTRATION_CHANNEL};
-use crate::cpu::recorder::{CpuRecords, Record};
+use crate::cpu::recorder::{CpuRecords, LocalReqRowStatistics, Record, ThreadLocalReq};
 use crate::{ResourceMeteringTag, TagInfos};
 
 use std::cell::Cell;
 use std::fs::read_dir;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -101,40 +101,13 @@ struct LocalReqTag {
     shared_ptr: SharedTagPtr,
 }
 
-pub struct LocalReqRowStatistics {
-    scan_row_count: AtomicU64,
-}
-
-impl LocalReqRowStatistics {
-    fn new() -> Self {
-        return Self {
-            scan_row_count: AtomicU64::new(0),
-        };
-    }
-
-    fn add_scan_row_count(&self, count: u64) {
-        self.scan_row_count.fetch_add(count, Ordering::Relaxed);
-    }
-
-    fn get_scan_row_count(&self) -> u64 {
-        self.scan_row_count.fetch_or(0, Ordering::Relaxed)
-    }
-
-    fn from(other: Arc<LocalReqRowStatistics>) -> Self {
-        return Self {
-            scan_row_count: AtomicU64::new(other.get_scan_row_count()),
-        };
-    }
-}
-
 thread_local! {
-    pub static LOCAL_REQ_SCAN_ROW_STATISTICS: Arc<LocalReqRowStatistics> = Arc::new(LocalReqRowStatistics::new());
     static CURRENT_REQ: LocalReqTag = {
         let thread_id = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
 
         let shared_ptr = SharedTagPtr::default();
-        let req_row_statistics = LOCAL_REQ_SCAN_ROW_STATISTICS.with(|s| {
-            s.clone()
+         let req_row_statistics = ThreadLocalReq::LOCAL_REQ_SCAN_ROW_STATISTICS.with(|s|{
+                    s.clone()
         });
         THREAD_REGISTRATION_CHANNEL.0.send(ThreadRegistrationMsg {
             thread_id,
@@ -304,11 +277,11 @@ impl CpuRecorder {
                             thread_stat
                                 .pre_req_row_statistics
                                 .add_scan_row_count(scan_rows);
-                            *self
+                            (*self)
                                 .current_window_records
                                 .records
                                 .entry(prev_tag)
-                                .or_insert(Record::new())
+                                .or_insert(Record::default())
                                 .merge(delta_ms as u32, scan_rows);
                         }
                     }
@@ -556,7 +529,7 @@ mod tests {
                 for (tag, record) in &records.records {
                     let str = String::from_utf8(tag.infos.extra_attachment.clone()).unwrap();
                     *r.entry(str)
-                        .or_insert(Record::new())
+                        .or_insert(Record::default())
                         .merge(record.cpu_time_ms, record.scan_rows);
                 }
             }
@@ -703,7 +676,7 @@ mod tests {
             let mut res = self.records.lock().unwrap();
 
             for k in expected.keys() {
-                res.entry(k.clone()).or_insert(Record::new());
+                res.entry(k.clone()).or_insert(Record::default());
             }
             for k in res.keys() {
                 expected.entry(k.clone()).or_insert(0);
