@@ -165,10 +165,6 @@ impl Runnable for ResourceMeteringReporter {
                                 .insert(tag.clone(), ReportRecord::new(timestamp_secs, record));
                         }
                     }
-                    println!(
-                        "collector record, cpu_time: {}, scan_row: {}",
-                        record.cpu_time_ms, record.scan_rows
-                    );
                 }
 
                 if self.records.len() > self.config.max_resource_groups {
@@ -241,6 +237,7 @@ impl RunnableWithTimer for ResourceMeteringReporter {
                             req.set_resource_group_tag(tag);
                             req.set_record_list_timestamp_sec(record.timestamp_secs);
                             req.set_record_list_cpu_time_ms(record.cpu_time_ms);
+                            req.set_record_list_scan_rows(record.scan_rows);
                             if tx.send((req, WriteFlags::default())).await.is_err() {
                                 return;
                             }
