@@ -72,7 +72,7 @@ pub struct CpuRecords {
     pub duration: Duration,
 
     // tag -> ms
-    pub records: HashMap<ResourceMeteringTag, u64>,
+    pub records: HashMap<ResourceMeteringTag, Record>,
 }
 
 impl Default for CpuRecords {
@@ -85,5 +85,24 @@ impl Default for CpuRecords {
             duration: Duration::default(),
             records: HashMap::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Record {
+    pub cpu_time_ms: u32,
+    pub scan_rows: u64,
+}
+
+impl Record {
+    pub fn new() -> Self {
+        return Self {
+            cpu_time_ms: 0,
+            scan_rows: 0,
+        };
+    }
+    pub fn merge(&mut self, cpu_time_ms: u32, scan_rows: u64) {
+        self.cpu_time_ms += cpu_time_ms;
+        self.scan_rows += scan_rows;
     }
 }

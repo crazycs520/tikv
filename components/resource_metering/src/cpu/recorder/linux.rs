@@ -2,14 +2,14 @@
 
 use crate::cpu::collector::{Collector, CollectorId};
 use crate::cpu::collector::{CollectorRegistrationMsg, COLLECTOR_REGISTRATION_CHANNEL};
-use crate::cpu::recorder::CpuRecords;
+use crate::cpu::recorder::{CpuRecords, Record};
 use crate::{ResourceMeteringTag, TagInfos};
 
 use std::cell::Cell;
 use std::fs::read_dir;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -100,14 +100,46 @@ struct LocalReqTag {
     is_set: Cell<bool>,
     shared_ptr: SharedTagPtr,
 }
+
+pub struct LocalReqRowStatistics {
+    scan_row_count: AtomicU64,
+}
+
+impl LocalReqRowStatistics {
+    fn new() -> Self {
+        return Self {
+            scan_row_count: AtomicU64::new(0),
+        };
+    }
+
+    fn add_scan_row_count(&self, count: u64) {
+        self.scan_row_count.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn get_scan_row_count(&self) -> u64 {
+        self.scan_row_count.fetch_or(0, Ordering::Relaxed)
+    }
+
+    fn from(other: Arc<LocalReqRowStatistics>) -> Self {
+        return Self {
+            scan_row_count: AtomicU64::new(other.get_scan_row_count()),
+        };
+    }
+}
+
 thread_local! {
+    pub static LOCAL_REQ_SCAN_ROW_STATISTICS: Arc<LocalReqRowStatistics> = Arc::new(LocalReqRowStatistics::new());
     static CURRENT_REQ: LocalReqTag = {
         let thread_id = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
 
         let shared_ptr = SharedTagPtr::default();
+        let req_row_statistics = LOCAL_REQ_SCAN_ROW_STATISTICS.with(|s| {
+            s.clone()
+        });
         THREAD_REGISTRATION_CHANNEL.0.send(ThreadRegistrationMsg {
             thread_id,
             shared_ptr: shared_ptr.clone(),
+            req_row_statistics,
         }).ok();
 
         LocalReqTag {
@@ -142,6 +174,7 @@ lazy_static! {
 struct ThreadRegistrationMsg {
     thread_id: pid_t,
     shared_ptr: SharedTagPtr,
+    req_row_statistics: Arc<LocalReqRowStatistics>,
 }
 
 struct CpuRecorder {
@@ -161,6 +194,8 @@ struct ThreadStat {
     shared_ptr: SharedTagPtr,
     prev_tag: Option<ResourceMeteringTag>,
     prev_stat: pid::Stat,
+    req_row_statistics: Arc<LocalReqRowStatistics>,
+    pre_req_row_statistics: LocalReqRowStatistics,
 }
 
 impl CpuRecorder {
@@ -222,6 +257,7 @@ impl CpuRecorder {
         while let Ok(ThreadRegistrationMsg {
             thread_id,
             shared_ptr,
+            req_row_statistics,
         }) = THREAD_REGISTRATION_CHANNEL.1.try_recv()
         {
             self.thread_stats.insert(
@@ -230,6 +266,8 @@ impl CpuRecorder {
                     prev_stat: Stat::default(),
                     shared_ptr,
                     prev_tag: None,
+                    req_row_statistics,
+                    pre_req_row_statistics: LocalReqRowStatistics::new(),
                 },
             );
         }
@@ -261,11 +299,17 @@ impl CpuRecorder {
                             / (*CLK_TCK as u64);
 
                         if delta_ms != 0 {
+                            let scan_rows = thread_stat.req_row_statistics.get_scan_row_count()
+                                - thread_stat.pre_req_row_statistics.get_scan_row_count();
+                            thread_stat
+                                .pre_req_row_statistics
+                                .add_scan_row_count(scan_rows);
                             *self
                                 .current_window_records
                                 .records
                                 .entry(prev_tag)
-                                .or_insert(0) += delta_ms;
+                                .or_insert(Record::new())
+                                .merge(delta_ms as u32, scan_rows);
                         }
                     }
 
@@ -503,15 +547,17 @@ mod tests {
 
     #[derive(Default, Clone)]
     struct DummyCollector {
-        records: Arc<Mutex<HashMap<String, u64>>>,
+        records: Arc<Mutex<HashMap<String, Record>>>,
     }
 
     impl Collector for DummyCollector {
         fn collect(&self, records: Arc<CpuRecords>) {
             if let Ok(mut r) = self.records.lock() {
-                for (tag, ms) in &records.records {
+                for (tag, record) in &records.records {
                     let str = String::from_utf8(tag.infos.extra_attachment.clone()).unwrap();
-                    *r.entry(str).or_insert(0) += *ms;
+                    *r.entry(str)
+                        .or_insert(Record::new())
+                        .merge(record.cpu_time_ms, record.scan_rows);
                 }
             }
         }
@@ -657,7 +703,7 @@ mod tests {
             let mut res = self.records.lock().unwrap();
 
             for k in expected.keys() {
-                res.entry(k.clone()).or_insert(0);
+                res.entry(k.clone()).or_insert(Record::new());
             }
             for k in res.keys() {
                 expected.entry(k.clone()).or_insert(0);
