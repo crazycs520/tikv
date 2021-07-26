@@ -161,6 +161,10 @@ struct CpuRecorder {
     last_gc_instant: Instant,
 
     collectors: HashMap<CollectorId, Box<dyn Collector>>,
+
+    last_print_instant: Instant,
+    last_total_thread_record: Record,
+    cur_total_collected_record: Record,
 }
 
 struct ThreadStat {
@@ -186,6 +190,10 @@ impl CpuRecorder {
             current_window_records: CpuRecords::default(),
 
             collectors: HashMap::default(),
+
+            last_print_instant: now,
+            last_total_thread_record: Record::default(),
+            cur_total_collected_record: Record::default(),
         }
     }
 
@@ -243,7 +251,29 @@ impl CpuRecorder {
                     pre_req_row_statistics: LocalReqRowStatistics::new(),
                 },
             );
+            info!("[topsql] register thread, id={}", thread_id);
         }
+    }
+
+    pub fn get_register_thread_cpu_time_ms(&mut self) -> u64 {
+        let mut total_cpu_time = 0u64;
+        for (tid, _thread_stat) in &mut self.thread_stats {
+            if let Ok(stat) = procinfo::pid::stat_task(*PID, *tid) {
+                let current_cpu_ticks = (stat.utime as u64).wrapping_add(stat.stime as u64);
+                let delta_ms = current_cpu_ticks * 1_000 / (*CLK_TCK as u64);
+                total_cpu_time += delta_ms;
+            }
+        }
+        total_cpu_time
+    }
+
+    pub fn get_register_thread_scan_rows(&mut self) -> u64 {
+        let mut total_scan_rows = 0u64;
+        for (_tid, thread_stat) in &mut self.thread_stats {
+            let scan_rows = thread_stat.req_row_statistics.get_scan_row_count();
+            total_scan_rows += scan_rows;
+        }
+        total_scan_rows
     }
 
     pub fn record(&mut self) {
@@ -283,13 +313,13 @@ impl CpuRecorder {
                                 .entry(prev_tag)
                                 .or_insert(Record::default())
                                 .merge(delta_ms as u32, scan_rows);
+                            thread_stat.prev_stat = stat;
                         }
                     }
 
                     // Store the beginning stat for the current tag.
                     if cur_tag.is_some() {
                         thread_stat.prev_tag = cur_tag;
-                        thread_stat.prev_stat = stat;
                     }
                 }
             }
@@ -339,6 +369,10 @@ impl CpuRecorder {
             records.duration = duration;
 
             if !records.records.is_empty() {
+                for (_k, r) in records.records.iter() {
+                    self.cur_total_collected_record
+                        .merge(r.cpu_time_ms, r.scan_rows);
+                }
                 let records = Arc::new(records);
                 for collector in self.collectors.values() {
                     collector.collect(records.clone());
@@ -346,6 +380,31 @@ impl CpuRecorder {
             }
 
             self.last_collect_instant = Instant::now();
+
+            if self.last_print_instant.elapsed().as_secs() >= 10 {
+                let tmp_cpu_time = self.get_register_thread_cpu_time_ms();
+                let tmp_scan_rows = self.get_register_thread_scan_rows();
+                let cur_total_thread_cpu_ms =
+                    tmp_cpu_time - self.last_total_thread_record.cpu_time_ms as u64;
+                let cur_total_thread_scan_rows =
+                    tmp_scan_rows - self.last_total_thread_record.scan_rows as u64;
+                info!(
+                    "[topsql] cpu_diff: {}, scan_diff: {}, collect_cpu_time: {}s, thread_cpu_time: {}s, collect_scan_rows: {}, thread_scan_rows: {}",
+                    (cur_total_thread_cpu_ms as f64
+                        - self.cur_total_collected_record.cpu_time_ms as f64)
+                        as f64
+                        / 1000.0,
+                    cur_total_thread_scan_rows as i64
+                        - self.cur_total_collected_record.scan_rows as i64,
+                    self.cur_total_collected_record.cpu_time_ms as f64 / 1000.0,
+                    cur_total_thread_cpu_ms as f64 / 1000.0,
+                    self.cur_total_collected_record.scan_rows,
+                    cur_total_thread_scan_rows,
+                );
+                self.last_total_thread_record = Record::new(tmp_cpu_time as u32, tmp_scan_rows);
+                self.last_print_instant = Instant::now();
+                self.cur_total_collected_record = Record::default();
+            }
         }
 
         need_advance

@@ -95,6 +95,12 @@ pub struct Record {
 }
 
 impl Record {
+    pub fn new(cpu_time_ms: u32, scan_rows: u64) -> Self {
+        Self {
+            cpu_time_ms,
+            scan_rows,
+        }
+    }
     pub fn merge(&mut self, cpu_time_ms: u32, scan_rows: u64) {
         self.cpu_time_ms += cpu_time_ms;
         self.scan_rows += scan_rows;

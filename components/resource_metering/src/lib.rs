@@ -25,6 +25,11 @@ pub struct ResourceMeteringTag {
 }
 
 impl ResourceMeteringTag {
+    pub fn new(info: TagInfos) -> Self {
+        Self {
+            infos: Arc::new(info),
+        }
+    }
     pub fn from_rpc_context(context: &kvproto::kvrpcpb::Context) -> Self {
         Arc::new(TagInfos::from_rpc_context(context)).into()
     }
@@ -45,6 +50,15 @@ pub struct TagInfos {
 }
 
 impl TagInfos {
+    pub fn new(region_id: u64, resource_tag: Vec<u8>) -> Self {
+        Self {
+            store_id: 0,
+            region_id,
+            peer_id: 0,
+            extra_attachment: resource_tag,
+        }
+    }
+
     pub fn from_rpc_context(context: &kvproto::kvrpcpb::Context) -> Self {
         let peer = context.get_peer();
         TagInfos {
