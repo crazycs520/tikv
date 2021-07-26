@@ -165,6 +165,7 @@ struct CpuRecorder {
     last_print_instant: Instant,
     last_total_thread_record: Record,
     cur_total_collected_record: Record,
+    no_tag_total_collected_record: Record,
 }
 
 struct ThreadStat {
@@ -194,6 +195,7 @@ impl CpuRecorder {
             last_print_instant: now,
             last_total_thread_record: Record::default(),
             cur_total_collected_record: Record::default(),
+            no_tag_total_collected_record: Record::default(),
         }
     }
 
@@ -294,27 +296,32 @@ impl CpuRecorder {
                 // If existing previous tag, need to get the end stat to calculate delta.
                 if let Ok(stat) = procinfo::pid::stat_task(*PID, *tid) {
                     // Accumulate the cpu time for the previous tag.
-                    if let Some(prev_tag) = prev_tag {
-                        let prev_cpu_ticks = (thread_stat.prev_stat.utime as u64)
-                            .wrapping_add(thread_stat.prev_stat.stime as u64);
-                        let current_cpu_ticks = (stat.utime as u64).wrapping_add(stat.stime as u64);
-                        let delta_ms = current_cpu_ticks.wrapping_sub(prev_cpu_ticks) * 1_000
-                            / (*CLK_TCK as u64);
+                    let prev_cpu_ticks = (thread_stat.prev_stat.utime as u64)
+                        .wrapping_add(thread_stat.prev_stat.stime as u64);
+                    let current_cpu_ticks = (stat.utime as u64).wrapping_add(stat.stime as u64);
+                    let delta_ms =
+                        current_cpu_ticks.wrapping_sub(prev_cpu_ticks) * 1_000 / (*CLK_TCK as u64);
+                    let scan_rows = thread_stat.req_row_statistics.get_scan_row_count()
+                        - thread_stat.pre_req_row_statistics.get_scan_row_count();
+                    thread_stat
+                        .pre_req_row_statistics
+                        .add_scan_row_count(scan_rows);
 
-                        if delta_ms != 0 {
-                            let scan_rows = thread_stat.req_row_statistics.get_scan_row_count()
-                                - thread_stat.pre_req_row_statistics.get_scan_row_count();
-                            thread_stat
-                                .pre_req_row_statistics
-                                .add_scan_row_count(scan_rows);
+                    if let Some(prev_tag) = prev_tag {
+                        if delta_ms != 0 || scan_rows != 0 {
                             (*self)
                                 .current_window_records
                                 .records
                                 .entry(prev_tag)
                                 .or_insert(Record::default())
                                 .merge(delta_ms as u32, scan_rows);
-                            thread_stat.prev_stat = stat;
                         }
+                    } else {
+                        self.no_tag_total_collected_record
+                            .merge(delta_ms as u32, scan_rows);
+                    }
+                    if delta_ms != 0 {
+                        thread_stat.prev_stat = stat;
                     }
 
                     // Store the beginning stat for the current tag.
@@ -389,13 +396,15 @@ impl CpuRecorder {
                 let cur_total_thread_scan_rows =
                     tmp_scan_rows - self.last_total_thread_record.scan_rows as u64;
                 info!(
-                    "[topsql] cpu_diff: {}, scan_diff: {}, collect_cpu_time: {}s, thread_cpu_time: {}s, collect_scan_rows: {}, thread_scan_rows: {}",
+                    "[topsql] cpu_diff: {}, scan_diff: {},no_prev_tag_cpu: {}s, no_tag_scan_rows:{},  collect_cpu_time: {}s, thread_cpu_time: {}s, collect_scan_rows: {}, thread_scan_rows: {}",
                     (cur_total_thread_cpu_ms as f64
                         - self.cur_total_collected_record.cpu_time_ms as f64)
                         as f64
                         / 1000.0,
                     cur_total_thread_scan_rows as i64
                         - self.cur_total_collected_record.scan_rows as i64,
+                    self.no_tag_total_collected_record.cpu_time_ms as f64 / 1000.0,
+                    self.no_tag_total_collected_record.scan_rows,
                     self.cur_total_collected_record.cpu_time_ms as f64 / 1000.0,
                     cur_total_thread_cpu_ms as f64 / 1000.0,
                     self.cur_total_collected_record.scan_rows,
@@ -404,6 +413,7 @@ impl CpuRecorder {
                 self.last_total_thread_record = Record::new(tmp_cpu_time as u32, tmp_scan_rows);
                 self.last_print_instant = Instant::now();
                 self.cur_total_collected_record = Record::default();
+                self.no_tag_total_collected_record = Record::default();
             }
         }
 
@@ -432,6 +442,7 @@ impl CpuRecorder {
     }
 
     fn reset(&mut self) {
+        info!("reset !!!!");
         let now = Instant::now();
         self.current_window_records = CpuRecords::default();
         for v in self.thread_stats.values_mut() {
