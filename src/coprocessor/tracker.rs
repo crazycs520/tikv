@@ -11,6 +11,7 @@ use tikv_util::time::{self, Duration, Instant};
 use super::metrics::*;
 use crate::coprocessor::*;
 use crate::storage::Statistics;
+use std::cell::RefCell;
 
 use txn_types::Key;
 
@@ -70,6 +71,11 @@ pub struct Tracker {
 
     // Request info, used to print slow log.
     pub req_ctx: ReqContext,
+}
+
+thread_local! {
+    pub static TOTAL_POLL_TIME: RefCell<Duration> = RefCell::new(Duration::default());
+    pub static MAX_POLL_TIME: RefCell<Duration> = RefCell::new(Duration::default());
 }
 
 impl Tracker {
@@ -156,6 +162,22 @@ impl Tracker {
             // Record delta perf statistics
             self.total_perf_stats += perf_statistics;
             self.current_stage = TrackerState::ItemFinished(now);
+
+            MAX_POLL_TIME.with(|s| {
+                if *s.borrow() < self.item_process_time {
+                    *s.borrow_mut() = self.item_process_time;
+                }
+            });
+            TOTAL_POLL_TIME.with(|s| {
+                *s.borrow_mut() += self.item_process_time;
+                if (*s.borrow()).as_secs() > 10 {
+                    *s.borrow_mut() = Duration::default();
+                    MAX_POLL_TIME.with(|s| {
+                        info!("max pool time is: {:?}", *s.borrow());
+                        *s.borrow_mut() = Duration::default();
+                    });
+                }
+            });
         } else {
             unreachable!()
         }
