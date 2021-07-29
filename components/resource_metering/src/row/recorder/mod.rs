@@ -26,6 +26,9 @@ pub fn on_poll_begin() {
 }
 
 pub fn on_poll_finish(tag: Vec<u8>) {
+    if tag.is_empty() {
+        return;
+    }
     CURRENT_REQ_ROW.with(|r| {
         let row_stats = r.row_stats.borrow();
         if row_stats.read_row_count > 0 || row_stats.read_index_count > 0 {
