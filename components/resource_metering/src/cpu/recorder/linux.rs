@@ -294,8 +294,10 @@ impl CpuRecorder {
                 // If existing previous tag, need to get the end stat to calculate delta.
                 if let Ok(stat) = procinfo::pid::stat_task(*PID, *tid) {
                     let scan_rows = thread_stat.req_row_statistics.get_scan_row_count()
-                            - thread_stat.pre_req_row_statistics.get_scan_row_count();
+                        - thread_stat.pre_req_row_statistics.get_scan_row_count();
+                    let mut has_prev_tag = false;
                     if let Some(prev_tag) = prev_tag {
+                        has_prev_tag = true;
                         // Accumulate the cpu time for the previous tag.
                         let prev_cpu_ticks = (thread_stat.prev_stat.utime as u64)
                             .wrapping_add(thread_stat.prev_stat.stime as u64);
@@ -314,8 +316,17 @@ impl CpuRecorder {
                     }
 
                     // Store the beginning stat for the current tag.
-                    if cur_tag.is_some() {
-                        thread_stat.prev_tag = cur_tag;
+                    if let Some(tag) = cur_tag {
+                        if !has_prev_tag {
+                            (*self)
+                                .current_window_records
+                                .records
+                                .entry(tag.clone())
+                                .or_insert(Record::default())
+                                .merge(0, scan_rows);
+                        }
+
+                        thread_stat.prev_tag = Some(tag.clone());
                         thread_stat.prev_stat = stat;
                         thread_stat
                             .pre_req_row_statistics
