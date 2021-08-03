@@ -293,6 +293,8 @@ impl CpuRecorder {
                 // If existing current tag, need to store the beginning stat.
                 // If existing previous tag, need to get the end stat to calculate delta.
                 if let Ok(stat) = procinfo::pid::stat_task(*PID, *tid) {
+                    let scan_rows = thread_stat.req_row_statistics.get_scan_row_count()
+                            - thread_stat.pre_req_row_statistics.get_scan_row_count();
                     if let Some(prev_tag) = prev_tag {
                         // Accumulate the cpu time for the previous tag.
                         let prev_cpu_ticks = (thread_stat.prev_stat.utime as u64)
@@ -300,11 +302,6 @@ impl CpuRecorder {
                         let current_cpu_ticks = (stat.utime as u64).wrapping_add(stat.stime as u64);
                         let delta_ms = current_cpu_ticks.wrapping_sub(prev_cpu_ticks) * 1_000
                             / (*CLK_TCK as u64);
-                        let scan_rows = thread_stat.req_row_statistics.get_scan_row_count()
-                            - thread_stat.pre_req_row_statistics.get_scan_row_count();
-                        thread_stat
-                            .pre_req_row_statistics
-                            .add_scan_row_count(scan_rows);
 
                         if delta_ms != 0 || scan_rows != 0 {
                             (*self)
@@ -313,13 +310,16 @@ impl CpuRecorder {
                                 .entry(prev_tag)
                                 .or_insert(Record::default())
                                 .merge(delta_ms as u32, scan_rows);
-                            thread_stat.prev_stat = stat;
                         }
                     }
 
                     // Store the beginning stat for the current tag.
                     if cur_tag.is_some() {
                         thread_stat.prev_tag = cur_tag;
+                        thread_stat.prev_stat = stat;
+                        thread_stat
+                            .pre_req_row_statistics
+                            .add_scan_row_count(scan_rows);
                     }
                 }
             }
