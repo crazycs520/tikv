@@ -38,12 +38,10 @@ pub fn on_poll_finish(tag: Vec<u8>) {
                 .entry(tag)
                 .or_insert(RowStats::default())
                 .merge(row_stats.deref());
-            println!("add row stats， {:?}", row_stats.deref());
         }
 
         let duration = r.last_collect_instant.borrow().saturating_elapsed();
         if duration.as_millis() > 1000 {
-            println!("send row stats start");
             let row_records = r.row_records.borrow_mut().take_and_reset();
             let row_records = Arc::new(row_records);
             {
@@ -54,7 +52,6 @@ pub fn on_poll_finish(tag: Vec<u8>) {
             }
 
             *r.last_collect_instant.borrow_mut() = Instant::now();
-            println!("send row stats");
         }
     })
 }
