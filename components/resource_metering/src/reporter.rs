@@ -84,6 +84,7 @@ impl ResourceMeteringReporter {
             find_top_k: Vec::default(),
         };
         if reporter.config.should_report() {
+            info!("init top sql client in new");
             reporter.init_client();
         }
         reporter
@@ -120,6 +121,7 @@ impl Runnable for ResourceMeteringReporter {
                 } else if self.config.receiver_address != old_config_receiver_address
                     || self.config.enabled != old_config_enabled
                 {
+                    info!("init top sql client in config change");
                     self.init_client();
                 }
             }
