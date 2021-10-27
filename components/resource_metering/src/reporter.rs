@@ -90,6 +90,7 @@ impl ResourceMeteringReporter {
     }
 
     pub fn init_client(&mut self) {
+        info!("init top sql client");
         let channel = {
             let cb = ChannelBuilder::new(self.env.clone())
                 .keepalive_time(Duration::from_secs(10))
@@ -111,6 +112,7 @@ impl Runnable for ResourceMeteringReporter {
     fn run(&mut self, task: Self::Task) {
         match task {
             Task::ConfigChange(new_config) => {
+                info!("topsql config change");
                 let old_config_enabled = self.config.enabled;
                 let old_config_receiver_address = self.config.receiver_address.clone();
                 self.config = new_config;
@@ -124,6 +126,7 @@ impl Runnable for ResourceMeteringReporter {
                 }
             }
             Task::CpuRecords(records) => {
+                info!("topsql get cpu records");
                 let timestamp_secs = records.begin_unix_time_secs;
 
                 for (tag, ms) in &records.records {
@@ -192,11 +195,12 @@ impl RunnableWithTimer for ResourceMeteringReporter {
 
         let records = std::mem::take(&mut self.records);
         let others = std::mem::take(&mut self.others);
-
+        info!("begin to report 1");
         if self.reporting.load(SeqCst) {
             return;
         }
 
+        info!("begin to report 2");
         if let Some(client) = self.client.as_ref() {
             match client.report_cpu_time_opt(CallOption::default().timeout(Duration::from_secs(2)))
             {
@@ -223,6 +227,7 @@ impl RunnableWithTimer for ResourceMeteringReporter {
                             let mut req = CpuTimeRecord::default();
                             req.set_record_list_timestamp_sec(timestamp_list);
                             req.set_record_list_cpu_time_ms(cpu_time_ms_list);
+                            info!("begin to report 3");
                             if tx.send((req, WriteFlags::default())).await.is_err() {
                                 return;
                             }

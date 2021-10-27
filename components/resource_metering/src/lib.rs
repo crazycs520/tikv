@@ -77,7 +77,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            enabled: true,
+            enabled: false,
             receiver_address: "".to_string(),
             report_receiver_interval: ReadableDuration::minutes(1),
             max_resource_groups: 2000,
@@ -152,6 +152,7 @@ impl online_config::ConfigManager for ConfigManager {
         &mut self,
         change: ConfigChange,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        info!("topsql online config change");
         let mut new_config = self.current_config.clone();
         new_config.update(change);
         new_config.validate()?;

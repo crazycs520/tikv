@@ -330,9 +330,12 @@ impl CpuRecorder {
             let mut records = std::mem::take(&mut self.current_window_records);
             records.duration = duration;
 
+            info!("topsql recorder advance window 1");
             if !records.records.is_empty() {
+                info!("topsql recorder advance window 2");
                 let records = Arc::new(records);
                 for collector in self.collectors.values() {
+                    info!("topsql recorder advance window 3");
                     collector.collect(records.clone());
                 }
             }
