@@ -77,7 +77,7 @@ pub struct Service<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockMan
     // For handling KV requests.
     storage: Storage<E, L, F>,
     // For handling coprocessor requests.
-    copr: Endpoint<E>,
+    copr: Arc<Endpoint<E>>,
     // For handling corprocessor v2 requests.
     copr_v2: coprocessor_v2::Endpoint,
     // For handling raft messages.
@@ -130,7 +130,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, F: KvFor
         store_id: u64,
         storage: Storage<E, L, F>,
         gc_worker: GcWorker<E, T>,
-        copr: Endpoint<E>,
+        copr: Arc<Endpoint<E>>,
         copr_v2: coprocessor_v2::Endpoint,
         ch: T,
         snap_scheduler: Scheduler<SnapTask>,
@@ -1284,7 +1284,7 @@ fn handle_batch_commands_request<
 >(
     batcher: &mut Option<ReqBatcher>,
     storage: &Storage<E, L, F>,
-    copr: &Endpoint<E>,
+    copr: &Arc<Endpoint<E>>,
     copr_v2: &coprocessor_v2::Endpoint,
     peer: &str,
     id: u64,
@@ -2102,7 +2102,7 @@ fn future_raw_checksum<E: Engine, L: LockManager, F: KvFormat>(
 }
 
 fn future_copr<E: Engine>(
-    copr: &Endpoint<E>,
+    copr: &Arc<Endpoint<E>>,
     peer: Option<String>,
     req: Request,
 ) -> impl Future<Output = ServerResult<MemoryTraceGuard<Response>>> {

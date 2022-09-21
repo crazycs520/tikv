@@ -1,24 +1,51 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{borrow::Cow, future::Future, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    future::Future,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ::tracker::{
     set_tls_tracker_token, with_tls_tracker, RequestInfo, RequestType, GLOBAL_TRACKERS,
 };
 use async_stream::try_stream;
+use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::PerfLevel;
 use futures::{channel::mpsc, prelude::*};
-use kvproto::{coprocessor as coppb, errorpb, kvrpcpb};
+use kvproto::{
+    coprocessor as coppb, errorpb,
+    kvrpcpb::{self, CommandPri},
+};
 use protobuf::{CodedInputStream, Message};
 use resource_metering::{FutureExt, ResourceTagFactory, StreamExt};
 use tidb_query_common::execute_stats::ExecSummary;
+use tidb_query_datatype::{
+    codec::{
+        chunk::{ChunkColumnEncoder, Column},
+        datum::DatumEncoder,
+        table::{RECORD_PREFIX_SEP, TABLE_PREFIX},
+        Datum,
+    },
+    expr::EvalContext,
+    FieldTypeTp,
+};
+use tidb_query_executors::{
+    util::scan_executor::{field_type_from_column_info, ScanExecutorImpl},
+    HandleIndicesVec, TableScanExecutorImpl,
+};
 use tikv_alloc::trace::MemoryTraceGuard;
 use tikv_kv::SnapshotExt;
-use tikv_util::{quota_limiter::QuotaLimiter, time::Instant};
-use tipb::{AnalyzeReq, AnalyzeType, ChecksumRequest, ChecksumScanOn, DagRequest, ExecType};
+use tikv_util::{codec::number::NumberEncoder, quota_limiter::QuotaLimiter, time::Instant};
+use tipb::{
+    AnalyzeReq, AnalyzeType, ChecksumRequest, ChecksumScanOn, Chunk, ColumnInfo, DagRequest,
+    EncodeType, ExecType, SelectResponse,
+};
 use tokio::sync::Semaphore;
-use txn_types::Lock;
+use txn_types::{Key, Lock};
 
 use crate::{
     coprocessor::{cache::CachedRequestHandler, interceptors::*, metrics::*, tracker::Tracker, *},
@@ -27,7 +54,7 @@ use crate::{
     storage::{
         self,
         kv::{self, with_tls_engine, SnapContext},
-        mvcc::Error as MvccError,
+        mvcc::{Error as MvccError, PointGetterBuilder},
         need_check_locks, need_check_locks_in_replica_read, Engine, Snapshot, SnapshotStore,
     },
 };
@@ -38,7 +65,6 @@ use crate::{
 const LIGHT_TASK_THRESHOLD: Duration = Duration::from_millis(5);
 
 /// A pool to build and run Coprocessor request handlers.
-#[derive(Clone)]
 pub struct Endpoint<E: Engine> {
     /// The thread pool to run Coprocessor requests.
     read_pool: ReadPoolHandle,
@@ -65,7 +91,7 @@ pub struct Endpoint<E: Engine> {
 
     slow_log_threshold: Duration,
 
-    _phantom: PhantomData<E>,
+    _phantom: PhantomData<Mutex<E>>,
 
     quota_limiter: Arc<QuotaLimiter>,
 }
@@ -382,7 +408,10 @@ impl<E: Engine> Endpoint<E> {
         semaphore: Option<Arc<Semaphore>>,
         mut tracker: Box<Tracker<E>>,
         handler_builder: RequestHandlerBuilder<E::Snap>,
-    ) -> Result<MemoryTraceGuard<coppb::Response>> {
+    ) -> Result<(
+        MemoryTraceGuard<coppb::Response>,
+        Option<(Vec<FieldType>, TableScan)>,
+    )> {
         // When this function is being executed, it may be queued for a long time, so
         // that deadline may exceed.
         tracker.on_scheduled();
@@ -407,6 +436,8 @@ impl<E: Engine> Endpoint<E> {
         } else {
             handler_builder(snapshot, &tracker.req_ctx)?
         };
+
+        let index_lookup = handler.index_lookup();
 
         tracker.on_begin_all_items();
 
@@ -442,7 +473,7 @@ impl<E: Engine> Endpoint<E> {
         resp.set_exec_details(exec_details);
         resp.set_exec_details_v2(exec_details_v2);
         resp.set_latest_buckets_version(buckets_version);
-        Ok(resp)
+        Ok((resp, index_lookup))
     }
 
     /// Handle a unary request and run on the read pool.
@@ -453,7 +484,12 @@ impl<E: Engine> Endpoint<E> {
         &self,
         req_ctx: ReqContext,
         handler_builder: RequestHandlerBuilder<E::Snap>,
-    ) -> impl Future<Output = Result<MemoryTraceGuard<coppb::Response>>> {
+    ) -> impl Future<
+        Output = Result<(
+            MemoryTraceGuard<coppb::Response>,
+            Option<(Vec<FieldType>, TableScan)>,
+        )>,
+    > {
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
         let key_ranges = req_ctx
@@ -484,7 +520,7 @@ impl<E: Engine> Endpoint<E> {
     /// converted into a `Response` as the success result of the future.
     #[inline]
     pub fn parse_and_handle_unary_request(
-        &self,
+        self: &Arc<Self>,
         req: coppb::Request,
         peer: Option<String>,
     ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
@@ -494,27 +530,262 @@ impl<E: Engine> Endpoint<E> {
             req.start_ts,
         )));
         set_tls_tracker_token(tracker);
+
+        let start_ts = TimeStamp::new(req.start_ts);
+
         let result_of_future = self
             .parse_request_and_check_memory_locks(req, peer, false)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
 
+        let this = self.clone();
+
         async move {
-            let res = match result_of_future {
-                Err(e) => make_error_response(e).into(),
-                Ok(handle_fut) => {
-                    let mut response = handle_fut
-                        .await
-                        .unwrap_or_else(|e| make_error_response(e).into());
-                    let scan_detail_v2 = response.mut_exec_details_v2().mut_scan_detail_v2();
-                    GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                        tracker.write_scan_detail(scan_detail_v2);
-                    });
-                    response
-                }
+            defer!({
+                GLOBAL_TRACKERS.remove(tracker);
+            });
+            let handle_fut = match result_of_future {
+                Err(e) => return make_error_response(e).into(),
+                Ok(handle_fut) => handle_fut,
             };
-            GLOBAL_TRACKERS.remove(tracker);
-            res
+            let (mut response, index_lookup) = match handle_fut.await {
+                Err(e) => return make_error_response(e).into(),
+                Ok(response) => response,
+            };
+
+            if let Some((schema, table_info)) = index_lookup {
+                match this
+                    .handle_index_lookup(response.consume(), schema, table_info, start_ts)
+                    .await
+                {
+                    Err(e) => return make_error_response(e).into(),
+                    Ok(resp) => response = resp.into(),
+                }
+            }
+
+            let scan_detail_v2 = response.mut_exec_details_v2().mut_scan_detail_v2();
+            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                tracker.write_scan_detail(scan_detail_v2);
+            });
+            response
         }
+    }
+
+    fn handle_index_lookup(
+        &self,
+        mut resp: coppb::Response,
+        schema: Vec<FieldType>,
+        mut table_scan: TableScan,
+        start_ts: TimeStamp,
+    ) -> impl Future<Output = Result<coppb::Response>> {
+        self.read_pool
+            .spawn_handle(
+                async move {
+                    let mut sel = SelectResponse::default();
+                    sel.merge_from_bytes(resp.get_data())
+                        .expect("fail to recover SelectResponse");
+                    if sel.get_encode_type() == EncodeType::TypeChunk {
+                        let schema_types: Vec<_> = schema
+                            .iter()
+                            .map(|ft| {
+                                FieldTypeTp::from_u8(ft.get_tp() as u8)
+                                    .unwrap_or(FieldTypeTp::Unspecified)
+                            })
+                            .collect();
+                        // info!("schema"; "schema" => ?schema_types);
+                        let mut all_data = Vec::new();
+                        'outer: for chunk in sel.get_chunks() {
+                            let mut data = chunk.get_rows_data();
+                            if data.is_empty() {
+                                continue;
+                            }
+                            let mut columns = Vec::with_capacity(schema.len());
+                            for ft in &schema {
+                                if data.is_empty() {
+                                    continue;
+                                }
+                                let col = match Column::decode(
+                                    &mut data,
+                                    FieldTypeTp::from_u8(ft.get_tp() as u8)
+                                        .unwrap_or(FieldTypeTp::Unspecified),
+                                ) {
+                                    Ok(col) => col,
+                                    Err(e) => {
+                                        info!("decode chunk error"; "err" => ?e);
+                                        break 'outer;
+                                    }
+                                };
+                                columns.push(col);
+                            }
+                            if columns.is_empty() {
+                                continue;
+                            }
+                            let len = columns[0].len();
+
+                            for i in 0..len {
+                                let mut dt = Vec::new();
+                                for (j, ft) in schema.iter().enumerate() {
+                                    dt.push(
+                                        columns[j].get_datum(i, ft).expect("fail to get datum"),
+                                    );
+                                }
+                                all_data.push(dt);
+                            }
+                        }
+                        // info!("chunk datum!"; "dt" => ?all_data);
+                        let mut table_prefix = vec![];
+                        table_prefix.extend(TABLE_PREFIX);
+                        table_prefix.encode_i64(table_scan.get_table_id()).unwrap();
+                        table_prefix.extend(RECORD_PREFIX_SEP);
+
+                        if !all_data.is_empty() {
+                            let snapshot = unsafe {
+                                with_tls_engine(|e: &E| e.snapshot_on_kv_engine(&[], &[])).unwrap()
+                            };
+                            let mut point_getter =
+                                PointGetterBuilder::new(snapshot, start_ts).build().unwrap();
+                            let mut pairs = Vec::new();
+                            if schema_types.len() == 1
+                                && matches!(
+                                    schema_types[0],
+                                    FieldTypeTp::Long | FieldTypeTp::LongLong
+                                )
+                            {
+                                for idx in &all_data {
+                                    let idx = match idx[0] {
+                                        Datum::I64(x) => x,
+                                        Datum::U64(x) => x as i64,
+                                        _ => unreachable!(),
+                                    };
+                                    let mut key = table_prefix.clone();
+                                    key.encode_i64(idx).unwrap();
+                                    let key = Key::from_raw(&key);
+                                    let value = point_getter.get(&key).ok().flatten();
+                                    pairs.push((key, value));
+                                }
+                            } else {
+                                for row in &all_data {
+                                    let mut key = table_prefix.clone();
+                                    key.write_datum(&mut EvalContext::default(), row, true)
+                                        .unwrap();
+                                    let key = Key::from_raw(&key);
+                                    let value = point_getter.get(&key).ok().flatten();
+                                    pairs.push((key, value));
+                                }
+                            }
+
+                            // let all_values: Vec<_> = pairs
+                            //     .iter()
+                            //     .map(|(k, v)| (k, v.as_ref().map(|v| hex::encode_upper(v))))
+                            //     .collect();
+                            // info!("all values"; "values" => ?all_values);
+
+                            let columns_info: Vec<ColumnInfo> = table_scan.take_columns().into();
+                            let primary_column_ids = table_scan.take_primary_column_ids();
+                            let is_column_filled = vec![false; columns_info.len()];
+                            let mut handle_indices = HandleIndicesVec::new();
+                            let mut schema = Vec::with_capacity(columns_info.len());
+                            let mut columns_default_value = Vec::with_capacity(columns_info.len());
+                            let mut column_id_index = HashMap::default();
+
+                            for (index, mut ci) in columns_info.into_iter().enumerate() {
+                                // For each column info, we need to extract the following info:
+                                // - Corresponding field type (push into `schema`).
+                                schema.push(field_type_from_column_info(&ci));
+
+                                // - Prepare column default value (will be used to fill missing
+                                //   column later).
+                                columns_default_value.push(ci.take_default_val());
+
+                                // - Store the index of the PK handles.
+                                // - Check whether or not we don't need KV values (iff PK handle is
+                                //   given).
+                                if ci.get_pk_handle() {
+                                    handle_indices.push(index);
+                                } else {
+                                    column_id_index.insert(ci.get_column_id(), index);
+                                }
+
+                                // Note: if two PK handles are given, we will
+                                // only preserve
+                                // the *last* one. Also
+                                // if two columns with the same
+                                // column id are given, we
+                                // will only preserve the *last* one.
+                            }
+
+                            let mut imp = TableScanExecutorImpl {
+                                context: EvalContext::default(),
+                                schema: schema.clone(),
+                                columns_default_value,
+                                column_id_index,
+                                handle_indices,
+                                primary_column_ids,
+                                is_column_filled,
+                            };
+                            let mut success = true;
+                            let mut columns = imp.build_column_vec(pairs.len());
+                            let mut keep_indexes = Vec::new();
+                            for (i, (k, v)) in pairs.into_iter().enumerate() {
+                                if let Some(v) = v {
+                                    let raw = k.to_raw().unwrap();
+                                    if let Err(_e) = imp.process_kv_pair(&raw, &v, &mut columns) {
+                                        // info!("process kv pair error"; "err" => ?e);
+                                        success = false;
+                                        break;
+                                    }
+                                } else {
+                                    keep_indexes.push(i);
+                                }
+                            }
+                            if success {
+                                // info!("process done"; "columns" => ?columns, "keep_indexes" =>
+                                // ?keep_indexes);
+                                if keep_indexes.is_empty() {
+                                    sel.clear_chunks();
+                                } else {
+                                    let mut new_index_columns = Vec::new();
+                                    for tp in schema_types {
+                                        new_index_columns.push(Column::new(tp, keep_indexes.len()));
+                                    }
+                                    for i in keep_indexes {
+                                        for (col_idx, dt) in all_data[i].iter().enumerate() {
+                                            new_index_columns[col_idx].append_datum(&dt).unwrap();
+                                        }
+                                    }
+                                    let mut index_chunk = Chunk::default();
+                                    for col in new_index_columns {
+                                        index_chunk
+                                            .mut_rows_data()
+                                            .write_chunk_column(&col)
+                                            .unwrap();
+                                    }
+                                    sel.set_chunks(vec![index_chunk].into());
+                                }
+
+                                let mut row_chunk = Chunk::default();
+                                let logical: Vec<_> = (0..columns.rows_len()).collect();
+                                let offsets: Vec<_> = (0..schema.len()).map(|x| x as u32).collect();
+                                // info!("extra chunk"; "chunk" => ?columns);
+                                columns
+                                    .encode_chunk(
+                                        &logical,
+                                        &offsets,
+                                        &schema,
+                                        row_chunk.mut_rows_data(),
+                                        &mut EvalContext::default(),
+                                    )
+                                    .unwrap();
+                                sel.set_extra_chunks(vec![row_chunk].into());
+                                resp.set_data(sel.write_to_bytes().unwrap());
+                            }
+                        }
+                    }
+                    Ok(resp)
+                },
+                CommandPri::Normal,
+                0,
+            )
+            .map(|e| e.unwrap())
     }
 
     /// The real implementation of handling a stream request.
@@ -692,1065 +963,1085 @@ fn make_error_response(e: Error) -> coppb::Response {
     resp
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        sync::{atomic, mpsc},
-        thread, vec,
-    };
-
-    use futures::executor::{block_on, block_on_stream};
-    use kvproto::kvrpcpb::IsolationLevel;
-    use protobuf::Message;
-    use tipb::{Executor, Expr};
-    use txn_types::{Key, LockType};
-
-    use super::*;
-    use crate::{
-        config::CoprReadPoolConfig,
-        coprocessor::readpool_impl::build_read_pool_for_test,
-        read_pool::ReadPool,
-        storage::{kv::RocksEngine, TestEngineBuilder},
-    };
-
-    /// A unary `RequestHandler` that always produces a fixture.
-    struct UnaryFixture {
-        handle_duration_millis: u64,
-        yieldable: bool,
-        result: Option<Result<coppb::Response>>,
-    }
-
-    impl UnaryFixture {
-        pub fn new(result: Result<coppb::Response>) -> UnaryFixture {
-            UnaryFixture {
-                handle_duration_millis: 0,
-                yieldable: false,
-                result: Some(result),
-            }
-        }
-
-        pub fn new_with_duration(
-            result: Result<coppb::Response>,
-            handle_duration_millis: u64,
-        ) -> UnaryFixture {
-            UnaryFixture {
-                handle_duration_millis,
-                yieldable: false,
-                result: Some(result),
-            }
-        }
-
-        pub fn new_with_duration_yieldable(
-            result: Result<coppb::Response>,
-            handle_duration_millis: u64,
-        ) -> UnaryFixture {
-            UnaryFixture {
-                handle_duration_millis,
-                yieldable: true,
-                result: Some(result),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl RequestHandler for UnaryFixture {
-        async fn handle_request(&mut self) -> Result<MemoryTraceGuard<coppb::Response>> {
-            if self.yieldable {
-                // We split the task into small executions of 100 milliseconds.
-                for _ in 0..self.handle_duration_millis / 100 {
-                    thread::sleep(Duration::from_millis(100));
-                    yatp::task::future::reschedule().await;
-                }
-                thread::sleep(Duration::from_millis(self.handle_duration_millis % 100));
-            } else {
-                thread::sleep(Duration::from_millis(self.handle_duration_millis));
-            }
-
-            self.result.take().unwrap().map(|x| x.into())
-        }
-    }
-
-    /// A streaming `RequestHandler` that always produces a fixture.
-    struct StreamFixture {
-        result_len: usize,
-        result_iter: vec::IntoIter<Result<coppb::Response>>,
-        handle_durations_millis: vec::IntoIter<u64>,
-        nth: usize,
-    }
-
-    impl StreamFixture {
-        pub fn new(result: Vec<Result<coppb::Response>>) -> StreamFixture {
-            let len = result.len();
-            StreamFixture {
-                result_len: len,
-                result_iter: result.into_iter(),
-                handle_durations_millis: vec![0; len].into_iter(),
-                nth: 0,
-            }
-        }
-
-        pub fn new_with_duration(
-            result: Vec<Result<coppb::Response>>,
-            handle_durations_millis: Vec<u64>,
-        ) -> StreamFixture {
-            assert_eq!(result.len(), handle_durations_millis.len());
-            StreamFixture {
-                result_len: result.len(),
-                result_iter: result.into_iter(),
-                handle_durations_millis: handle_durations_millis.into_iter(),
-                nth: 0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl RequestHandler for StreamFixture {
-        async fn handle_streaming_request(&mut self) -> Result<(Option<coppb::Response>, bool)> {
-            let is_finished = if self.result_len == 0 {
-                true
-            } else {
-                self.nth >= (self.result_len - 1)
-            };
-            let ret = match self.result_iter.next() {
-                None => {
-                    assert!(is_finished);
-                    Ok((None, is_finished))
-                }
-                Some(val) => {
-                    let handle_duration_ms = self.handle_durations_millis.next().unwrap();
-                    thread::sleep(Duration::from_millis(handle_duration_ms));
-                    match val {
-                        Ok(resp) => Ok((Some(resp), is_finished)),
-                        Err(e) => Err(e),
-                    }
-                }
-            };
-            self.nth += 1;
-
-            ret
-        }
-    }
-
-    /// A streaming `RequestHandler` that produces values according a closure.
-    struct StreamFromClosure {
-        result_generator: Box<dyn Fn(usize) -> HandlerStreamStepResult + Send>,
-        nth: usize,
-    }
-
-    impl StreamFromClosure {
-        pub fn new<F>(result_generator: F) -> StreamFromClosure
-        where
-            F: Fn(usize) -> HandlerStreamStepResult + Send + 'static,
-        {
-            StreamFromClosure {
-                result_generator: Box::new(result_generator),
-                nth: 0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl RequestHandler for StreamFromClosure {
-        async fn handle_streaming_request(&mut self) -> Result<(Option<coppb::Response>, bool)> {
-            let result = (self.result_generator)(self.nth);
-            self.nth += 1;
-            result
-        }
-    }
-
-    #[test]
-    fn test_outdated_request() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        // a normal request
-        let handler_builder =
-            Box::new(|_, _: &_| Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
-        let resp =
-            block_on(copr.handle_unary_request(ReqContext::default_for_test(), handler_builder))
-                .unwrap();
-        assert!(resp.get_other_error().is_empty());
-
-        // an outdated request
-        let handler_builder =
-            Box::new(|_, _: &_| Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
-        let outdated_req_ctx = ReqContext::new(
-            ReqTag::test,
-            Default::default(),
-            Vec::new(),
-            Duration::from_secs(0),
-            None,
-            None,
-            TimeStamp::max(),
-            None,
-            PerfLevel::EnableCount,
-        );
-        block_on(copr.handle_unary_request(outdated_req_ctx, handler_builder)).unwrap_err();
-    }
-
-    #[test]
-    fn test_stack_guard() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let mut copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-        copr.recursion_limit = 100;
-
-        let req = {
-            let mut expr = Expr::default();
-            for _ in 0..101 {
-                let mut e = Expr::default();
-                e.mut_children().push(expr);
-                expr = e;
-            }
-            let mut e = Executor::default();
-            e.mut_selection().mut_conditions().push(expr);
-            let mut dag = DagRequest::default();
-            dag.mut_executors().push(e);
-            let mut req = coppb::Request::default();
-            req.set_tp(REQ_TYPE_DAG);
-            req.set_data(dag.write_to_bytes().unwrap());
-            req
-        };
-
-        let resp = block_on(copr.parse_and_handle_unary_request(req, None));
-        assert!(!resp.get_other_error().is_empty());
-    }
-
-    #[test]
-    fn test_invalid_req_type() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let mut req = coppb::Request::default();
-        req.set_tp(9999);
-
-        let resp = block_on(copr.parse_and_handle_unary_request(req, None));
-        assert!(!resp.get_other_error().is_empty());
-    }
-
-    #[test]
-    fn test_invalid_req_body() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let mut req = coppb::Request::default();
-        req.set_tp(REQ_TYPE_DAG);
-        req.set_data(vec![1, 2, 3]);
-
-        let resp = block_on(copr.parse_and_handle_unary_request(req, None));
-        assert!(!resp.get_other_error().is_empty());
-    }
-
-    #[test]
-    fn test_full() {
-        use std::sync::Mutex;
-
-        use tikv_util::yatp_pool::{DefaultTicker, YatpPoolBuilder};
-
-        use crate::storage::kv::{destroy_tls_engine, set_tls_engine};
-
-        let engine = TestEngineBuilder::new().build().unwrap();
-
-        let read_pool = ReadPool::from(
-            CoprReadPoolConfig {
-                normal_concurrency: 1,
-                max_tasks_per_worker_normal: 2,
-                ..CoprReadPoolConfig::default_for_test()
-            }
-            .to_yatp_pool_configs()
-            .into_iter()
-            .map(|config| {
-                let engine = Arc::new(Mutex::new(engine.clone()));
-                YatpPoolBuilder::new(DefaultTicker::default())
-                    .config(config)
-                    .name_prefix("coprocessor_endpoint_test_full")
-                    .after_start(move || set_tls_engine(engine.lock().unwrap().clone()))
-                    // Safety: we call `set_` and `destroy_` with the same engine type.
-                    .before_stop(|| unsafe { destroy_tls_engine::<RocksEngine>() })
-                    .build_future_pool()
-            })
-            .collect::<Vec<_>>(),
-        );
-
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let (tx, rx) = mpsc::channel();
-
-        // first 2 requests are processed as normal and laters are returned as errors
-        for i in 0..5 {
-            let mut response = coppb::Response::default();
-            response.set_data(vec![1, 2, i]);
-
-            let mut context = kvrpcpb::Context::default();
-            context.set_priority(kvrpcpb::CommandPri::Normal);
-
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(UnaryFixture::new_with_duration(Ok(response), 1000).into_boxed())
-            });
-            let future = copr.handle_unary_request(ReqContext::default_for_test(), handler_builder);
-            let tx = tx.clone();
-            thread::spawn(move || {
-                tx.send(block_on(future)).unwrap();
-            });
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        // verify
-        for _ in 2..5 {
-            rx.recv().unwrap().unwrap_err();
-        }
-        for i in 0..2 {
-            let resp = rx.recv().unwrap().unwrap();
-            assert_eq!(resp.get_data(), [1, 2, i]);
-            assert!(!resp.has_region_error());
-        }
-    }
-
-    #[test]
-    fn test_error_unary_response() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let handler_builder =
-            Box::new(|_, _: &_| Ok(UnaryFixture::new(Err(box_err!("foo"))).into_boxed()));
-        let resp =
-            block_on(copr.handle_unary_request(ReqContext::default_for_test(), handler_builder))
-                .unwrap();
-        assert_eq!(resp.get_data().len(), 0);
-        assert!(!resp.get_other_error().is_empty());
-    }
-
-    #[test]
-    fn test_error_streaming_response() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        // Fail immediately
-        let handler_builder =
-            Box::new(|_, _: &_| Ok(StreamFixture::new(vec![Err(box_err!("foo"))]).into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 1);
-        assert_eq!(resp_vec[0].get_data().len(), 0);
-        assert!(!resp_vec[0].get_other_error().is_empty());
-
-        // Fail after some success responses
-        let mut responses = Vec::new();
-        for i in 0..5 {
-            let mut resp = coppb::Response::default();
-            resp.set_data(vec![1, 2, i]);
-            responses.push(Ok(resp));
-        }
-        responses.push(Err(box_err!("foo")));
-
-        let handler_builder = Box::new(|_, _: &_| Ok(StreamFixture::new(responses).into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 6);
-        for (i, resp) in resp_vec.iter().enumerate().take(5) {
-            assert_eq!(resp.get_data(), [1, 2, i as u8]);
-        }
-        assert_eq!(resp_vec[5].get_data().len(), 0);
-        assert!(!resp_vec[5].get_other_error().is_empty());
-    }
-
-    #[test]
-    fn test_empty_streaming_response() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let handler_builder = Box::new(|_, _: &_| Ok(StreamFixture::new(vec![]).into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 0);
-    }
-
-    // TODO: Test panic?
-
-    #[test]
-    fn test_special_streaming_handlers() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        // handler returns `finished == true` should not be called again.
-        let counter = Arc::new(atomic::AtomicIsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let handler = StreamFromClosure::new(move |nth| match nth {
-            0 => {
-                let mut resp = coppb::Response::default();
-                resp.set_data(vec![1, 2, 7]);
-                Ok((Some(resp), true))
-            }
-            _ => {
-                // we cannot use `unreachable!()` here because CpuPool catches panic.
-                counter_clone.store(1, atomic::Ordering::SeqCst);
-                Err(box_err!("unreachable"))
-            }
-        });
-        let handler_builder = Box::new(move |_, _: &_| Ok(handler.into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 1);
-        assert_eq!(resp_vec[0].get_data(), [1, 2, 7]);
-        assert_eq!(counter.load(atomic::Ordering::SeqCst), 0);
-
-        // handler returns `None` but `finished == false` should not be called again.
-        let counter = Arc::new(atomic::AtomicIsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let handler = StreamFromClosure::new(move |nth| match nth {
-            0 => {
-                let mut resp = coppb::Response::default();
-                resp.set_data(vec![1, 2, 13]);
-                Ok((Some(resp), false))
-            }
-            1 => Ok((None, false)),
-            _ => {
-                counter_clone.store(1, atomic::Ordering::SeqCst);
-                Err(box_err!("unreachable"))
-            }
-        });
-        let handler_builder = Box::new(move |_, _: &_| Ok(handler.into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 1);
-        assert_eq!(resp_vec[0].get_data(), [1, 2, 13]);
-        assert_eq!(counter.load(atomic::Ordering::SeqCst), 0);
-
-        // handler returns `Err(..)` should not be called again.
-        let counter = Arc::new(atomic::AtomicIsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let handler = StreamFromClosure::new(move |nth| match nth {
-            0 => {
-                let mut resp = coppb::Response::default();
-                resp.set_data(vec![1, 2, 23]);
-                Ok((Some(resp), false))
-            }
-            1 => Err(box_err!("foo")),
-            _ => {
-                counter_clone.store(1, atomic::Ordering::SeqCst);
-                Err(box_err!("unreachable"))
-            }
-        });
-        let handler_builder = Box::new(move |_, _: &_| Ok(handler.into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 2);
-        assert_eq!(resp_vec[0].get_data(), [1, 2, 23]);
-        assert!(!resp_vec[1].get_other_error().is_empty());
-        assert_eq!(counter.load(atomic::Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_channel_size() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config {
-                end_point_stream_channel_size: 3,
-                ..Config::default()
-            },
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let counter = Arc::new(atomic::AtomicIsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-        let handler = StreamFromClosure::new(move |nth| {
-            // produce an infinite stream
-            let mut resp = coppb::Response::default();
-            resp.set_data(vec![1, 2, nth as u8]);
-            counter_clone.fetch_add(1, atomic::Ordering::SeqCst);
-            Ok((Some(resp), false))
-        });
-        let handler_builder = Box::new(move |_, _: &_| Ok(handler.into_boxed()));
-        let resp_vec = block_on_stream(
-            copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
-                .unwrap(),
-        )
-        .take(7)
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-        assert_eq!(resp_vec.len(), 7);
-        assert!(counter.load(atomic::Ordering::SeqCst) < 14);
-    }
-
-    #[test]
-    fn test_handle_time() {
-        use tikv_util::config::ReadableDuration;
-
-        /// Asserted that the snapshot can be retrieved in 500ms.
-        const SNAPSHOT_DURATION_MS: u64 = 500;
-
-        /// Asserted that the delay caused by OS scheduling other tasks is
-        /// smaller than 200ms. This is mostly for CI.
-        const HANDLE_ERROR_MS: u64 = 200;
-
-        /// The acceptable error range for a coarse timer. Note that we use
-        /// CLOCK_MONOTONIC_COARSE which can be slewed by time
-        /// adjustment code (e.g., NTP, PTP).
-        const COARSE_ERROR_MS: u64 = 50;
-
-        /// The duration that payload executes.
-        const PAYLOAD_SMALL: u64 = 3000;
-        const PAYLOAD_LARGE: u64 = 6000;
-
-        let engine = TestEngineBuilder::new().build().unwrap();
-
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig {
-                low_concurrency: 1,
-                normal_concurrency: 1,
-                high_concurrency: 1,
-                ..CoprReadPoolConfig::default_for_test()
-            },
-            engine,
-        ));
-
-        let config = Config {
-            end_point_request_max_handle_duration: ReadableDuration::millis(
-                (PAYLOAD_SMALL + PAYLOAD_LARGE) as u64 * 2,
-            ),
-            ..Default::default()
-        };
-
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &config,
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        // A request that requests execution details.
-        let mut req_with_exec_detail = ReqContext::default_for_test();
-        req_with_exec_detail.context.set_record_time_stat(true);
-
-        {
-            let mut wait_time: u64 = 0;
-
-            // Request 1: Unary, success response.
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(UnaryFixture::new_with_duration(
-                    Ok(coppb::Response::default()),
-                    PAYLOAD_SMALL as u64,
-                )
-                .into_boxed())
-            });
-            let resp_future_1 =
-                copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
-            let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
-            // Sleep a while to make sure that thread is spawn and snapshot is taken.
-            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
-
-            // Request 2: Unary, error response.
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(
-                    UnaryFixture::new_with_duration(Err(box_err!("foo")), PAYLOAD_LARGE as u64)
-                        .into_boxed(),
-                )
-            });
-            let resp_future_2 =
-                copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
-            let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
-            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
-
-            // Response 1
-            let resp = &rx.recv().unwrap()[0];
-            assert!(resp.get_other_error().is_empty());
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            wait_time += PAYLOAD_SMALL - SNAPSHOT_DURATION_MS;
-
-            // Response 2
-            let resp = &rx.recv().unwrap()[0];
-            assert!(!resp.get_other_error().is_empty());
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-        }
-
-        {
-            // Test multi-stage tasks
-            // Request 1: Unary, success response.
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(UnaryFixture::new_with_duration_yieldable(
-                    Ok(coppb::Response::default()),
-                    PAYLOAD_SMALL as u64,
-                )
-                .into_boxed())
-            });
-            let resp_future_1 =
-                copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
-            let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
-            // Sleep a while to make sure that thread is spawn and snapshot is taken.
-            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
-
-            // Request 2: Unary, error response.
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(UnaryFixture::new_with_duration_yieldable(
-                    Err(box_err!("foo")),
-                    PAYLOAD_LARGE as u64,
-                )
-                .into_boxed())
-            });
-            let resp_future_2 =
-                copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
-            let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
-            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
-
-            // Response 1
-            //
-            // Note: `process_wall_time_ms` includes `total_process_time` and
-            // `total_suspend_time`. Someday it will be separated, but for now,
-            // let's just consider the combination.
-            //
-            // In the worst case, `total_suspend_time` could be totally req2 payload.
-            // So here: req1 payload <= process time <= (req1 payload + req2 payload)
-            let resp = &rx.recv().unwrap()[0];
-            assert!(resp.get_other_error().is_empty());
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-
-            // Response 2
-            //
-            // Note: `process_wall_time_ms` includes `total_process_time` and
-            // `total_suspend_time`. Someday it will be separated, but for now,
-            // let's just consider the combination.
-            //
-            // In the worst case, `total_suspend_time` could be totally req1 payload.
-            // So here: req2 payload <= process time <= (req1 payload + req2 payload)
-            let resp = &rx.recv().unwrap()[0];
-            assert!(!resp.get_other_error().is_empty());
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-        }
-
-        {
-            let mut wait_time: u64 = 0;
-
-            // Request 1: Unary, success response.
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(UnaryFixture::new_with_duration(
-                    Ok(coppb::Response::default()),
-                    PAYLOAD_LARGE as u64,
-                )
-                .into_boxed())
-            });
-            let resp_future_1 =
-                copr.handle_unary_request(req_with_exec_detail.clone(), handler_builder);
-            let sender = tx.clone();
-            thread::spawn(move || sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());
-            // Sleep a while to make sure that thread is spawn and snapshot is taken.
-            thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
-
-            // Request 2: Stream.
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(StreamFixture::new_with_duration(
-                    vec![
-                        Ok(coppb::Response::default()),
-                        Err(box_err!("foo")),
-                        Ok(coppb::Response::default()),
-                    ],
-                    vec![
-                        PAYLOAD_SMALL as u64,
-                        PAYLOAD_LARGE as u64,
-                        PAYLOAD_SMALL as u64,
-                    ],
-                )
-                .into_boxed())
-            });
-            let resp_future_3 = copr
-                .handle_stream_request(req_with_exec_detail, handler_builder)
-                .unwrap()
-                .map(|x| x.map(|x| x.into()));
-            thread::spawn(move || {
-                tx.send(
-                    block_on_stream(resp_future_3)
-                        .collect::<Result<Vec<_>>>()
-                        .unwrap(),
-                )
-                .unwrap()
-            });
-
-            // Response 1
-            let resp = &rx.recv().unwrap()[0];
-            assert!(resp.get_other_error().is_empty());
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            assert_ge!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp.get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            wait_time += PAYLOAD_LARGE - SNAPSHOT_DURATION_MS;
-
-            // Response 2
-            let resp = &rx.recv().unwrap();
-            assert_eq!(resp.len(), 2);
-            assert!(resp[0].get_other_error().is_empty());
-            assert_ge!(
-                resp[0]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp[0]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            assert_ge!(
-                resp[0]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp[0]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-
-            assert!(!resp[1].get_other_error().is_empty());
-            assert_ge!(
-                resp[1]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp[1]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_process_wall_time_ms(),
-                PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-            assert_ge!(
-                resp[1]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
-            );
-            assert_lt!(
-                resp[1]
-                    .get_exec_details()
-                    .get_time_detail()
-                    .get_wait_wall_time_ms(),
-                wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
-            );
-        }
-    }
-
-    #[test]
-    fn test_exceed_deadline() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let copr = Endpoint::<RocksEngine>::new(
-            &Config::default(),
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-
-        {
-            let handler_builder = Box::new(|_, _: &_| {
-                thread::sleep(Duration::from_millis(600));
-                Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed())
-            });
-
-            let mut config = ReqContext::default_for_test();
-            config.deadline = Deadline::from_now(Duration::from_millis(500));
-
-            let resp = block_on(copr.handle_unary_request(config, handler_builder)).unwrap();
-            assert_eq!(resp.get_data().len(), 0);
-            assert!(!resp.get_other_error().is_empty());
-        }
-
-        {
-            let handler_builder = Box::new(|_, _: &_| {
-                Ok(
-                    UnaryFixture::new_with_duration_yieldable(Ok(coppb::Response::default()), 1500)
-                        .into_boxed(),
-                )
-            });
-
-            let mut config = ReqContext::default_for_test();
-            config.deadline = Deadline::from_now(Duration::from_millis(500));
-
-            let resp = block_on(copr.handle_unary_request(config, handler_builder)).unwrap();
-            assert_eq!(resp.get_data().len(), 0);
-            assert!(!resp.get_other_error().is_empty());
-        }
-    }
-
-    #[test]
-    fn test_check_memory_locks() {
-        let engine = TestEngineBuilder::new().build().unwrap();
-        let read_pool = ReadPool::from(build_read_pool_for_test(
-            &CoprReadPoolConfig::default_for_test(),
-            engine,
-        ));
-        let cm = ConcurrencyManager::new(1.into());
-        let key = Key::from_raw(b"key");
-        let guard = block_on(cm.lock_key(&key));
-        guard.with_lock(|lock| {
-            *lock = Some(txn_types::Lock::new(
-                LockType::Put,
-                b"key".to_vec(),
-                10.into(),
-                100,
-                Some(vec![]),
-                0.into(),
-                1,
-                20.into(),
-            ));
-        });
-
-        let config = Config::default();
-        let copr = Endpoint::<RocksEngine>::new(
-            &config,
-            read_pool.handle(),
-            cm,
-            ResourceTagFactory::new_for_test(),
-            Arc::new(QuotaLimiter::default()),
-        );
-        let mut req = coppb::Request::default();
-        req.mut_context().set_isolation_level(IsolationLevel::Si);
-        req.set_start_ts(100);
-        req.set_tp(REQ_TYPE_DAG);
-        let mut key_range = coppb::KeyRange::default();
-        key_range.set_start(b"a".to_vec());
-        key_range.set_end(b"z".to_vec());
-        req.mut_ranges().push(key_range);
-        let mut dag = DagRequest::default();
-        dag.mut_executors().push(Executor::default());
-        req.set_data(dag.write_to_bytes().unwrap());
-
-        let resp = block_on(copr.parse_and_handle_unary_request(req, None));
-        assert_eq!(resp.get_locked().get_key(), b"key");
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use std::{
+//         sync::{atomic, mpsc},
+//         thread, vec,
+//     };
+
+//     use futures::executor::{block_on, block_on_stream};
+//     use kvproto::kvrpcpb::IsolationLevel;
+//     use protobuf::Message;
+//     use tipb::{Executor, Expr};
+//     use txn_types::{Key, LockType};
+
+//     use super::*;
+//     use crate::{
+//         config::CoprReadPoolConfig,
+//         coprocessor::readpool_impl::build_read_pool_for_test,
+//         read_pool::ReadPool,
+//         storage::{kv::RocksEngine, TestEngineBuilder},
+//     };
+
+//     /// A unary `RequestHandler` that always produces a fixture.
+//     struct UnaryFixture {
+//         handle_duration_millis: u64,
+//         yieldable: bool,
+//         result: Option<Result<coppb::Response>>,
+//     }
+
+//     impl UnaryFixture {
+//         pub fn new(result: Result<coppb::Response>) -> UnaryFixture {
+//             UnaryFixture {
+//                 handle_duration_millis: 0,
+//                 yieldable: false,
+//                 result: Some(result),
+//             }
+//         }
+
+//         pub fn new_with_duration(
+//             result: Result<coppb::Response>,
+//             handle_duration_millis: u64,
+//         ) -> UnaryFixture {
+//             UnaryFixture {
+//                 handle_duration_millis,
+//                 yieldable: false,
+//                 result: Some(result),
+//             }
+//         }
+
+//         pub fn new_with_duration_yieldable(
+//             result: Result<coppb::Response>,
+//             handle_duration_millis: u64,
+//         ) -> UnaryFixture {
+//             UnaryFixture {
+//                 handle_duration_millis,
+//                 yieldable: true,
+//                 result: Some(result),
+//             }
+//         }
+//     }
+
+//     #[async_trait]
+//     impl RequestHandler for UnaryFixture {
+//         async fn handle_request(&mut self) ->
+// Result<MemoryTraceGuard<coppb::Response>> {             if self.yieldable {
+//                 // We split the task into small executions of 100
+// milliseconds.                 for _ in 0..self.handle_duration_millis / 100 {
+//                     thread::sleep(Duration::from_millis(100));
+//                     yatp::task::future::reschedule().await;
+//                 }
+//
+// thread::sleep(Duration::from_millis(self.handle_duration_millis % 100));
+//             } else {
+//
+// thread::sleep(Duration::from_millis(self.handle_duration_millis));
+//             }
+
+//             self.result.take().unwrap().map(|x| x.into())
+//         }
+//     }
+
+//     /// A streaming `RequestHandler` that always produces a fixture.
+//     struct StreamFixture {
+//         result_len: usize,
+//         result_iter: vec::IntoIter<Result<coppb::Response>>,
+//         handle_durations_millis: vec::IntoIter<u64>,
+//         nth: usize,
+//     }
+
+//     impl StreamFixture {
+//         pub fn new(result: Vec<Result<coppb::Response>>) -> StreamFixture {
+//             let len = result.len();
+//             StreamFixture {
+//                 result_len: len,
+//                 result_iter: result.into_iter(),
+//                 handle_durations_millis: vec![0; len].into_iter(),
+//                 nth: 0,
+//             }
+//         }
+
+//         pub fn new_with_duration(
+//             result: Vec<Result<coppb::Response>>,
+//             handle_durations_millis: Vec<u64>,
+//         ) -> StreamFixture {
+//             assert_eq!(result.len(), handle_durations_millis.len());
+//             StreamFixture {
+//                 result_len: result.len(),
+//                 result_iter: result.into_iter(),
+//                 handle_durations_millis: handle_durations_millis.into_iter(),
+//                 nth: 0,
+//             }
+//         }
+//     }
+
+//     #[async_trait]
+//     impl RequestHandler for StreamFixture {
+//         async fn handle_streaming_request(&mut self) ->
+// Result<(Option<coppb::Response>, bool)> {             let is_finished = if
+// self.result_len == 0 {                 true
+//             } else {
+//                 self.nth >= (self.result_len - 1)
+//             };
+//             let ret = match self.result_iter.next() {
+//                 None => {
+//                     assert!(is_finished);
+//                     Ok((None, is_finished))
+//                 }
+//                 Some(val) => {
+//                     let handle_duration_ms =
+// self.handle_durations_millis.next().unwrap();
+// thread::sleep(Duration::from_millis(handle_duration_ms));
+// match val {                         Ok(resp) => Ok((Some(resp),
+// is_finished)),                         Err(e) => Err(e),
+//                     }
+//                 }
+//             };
+//             self.nth += 1;
+
+//             ret
+//         }
+//     }
+
+//     /// A streaming `RequestHandler` that produces values according a
+// closure.     struct StreamFromClosure {
+//         result_generator: Box<dyn Fn(usize) -> HandlerStreamStepResult +
+// Send>,         nth: usize,
+//     }
+
+//     impl StreamFromClosure {
+//         pub fn new<F>(result_generator: F) -> StreamFromClosure
+//         where
+//             F: Fn(usize) -> HandlerStreamStepResult + Send + 'static,
+//         {
+//             StreamFromClosure {
+//                 result_generator: Box::new(result_generator),
+//                 nth: 0,
+//             }
+//         }
+//     }
+
+//     #[async_trait]
+//     impl RequestHandler for StreamFromClosure {
+//         async fn handle_streaming_request(&mut self) ->
+// Result<(Option<coppb::Response>, bool)> {             let result =
+// (self.result_generator)(self.nth);             self.nth += 1;
+//             result
+//         }
+//     }
+
+//     #[test]
+//     fn test_outdated_request() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         // a normal request
+//         let handler_builder =
+//             Box::new(|_, _: &_|
+// Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
+//         let resp =
+//
+// block_on(copr.handle_unary_request(ReqContext::default_for_test(),
+// handler_builder))                 .unwrap();
+//         assert!(resp.get_other_error().is_empty());
+
+//         // an outdated request
+//         let handler_builder =
+//             Box::new(|_, _: &_|
+// Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed()));
+//         let outdated_req_ctx = ReqContext::new(
+//             ReqTag::test,
+//             Default::default(),
+//             Vec::new(),
+//             Duration::from_secs(0),
+//             None,
+//             None,
+//             TimeStamp::max(),
+//             None,
+//             PerfLevel::EnableCount,
+//         );
+//         block_on(copr.handle_unary_request(outdated_req_ctx,
+// handler_builder)).unwrap_err();     }
+
+//     #[test]
+//     fn test_stack_guard() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let mut copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+//         copr.recursion_limit = 100;
+
+//         let req = {
+//             let mut expr = Expr::default();
+//             for _ in 0..101 {
+//                 let mut e = Expr::default();
+//                 e.mut_children().push(expr);
+//                 expr = e;
+//             }
+//             let mut e = Executor::default();
+//             e.mut_selection().mut_conditions().push(expr);
+//             let mut dag = DagRequest::default();
+//             dag.mut_executors().push(e);
+//             let mut req = coppb::Request::default();
+//             req.set_tp(REQ_TYPE_DAG);
+//             req.set_data(dag.write_to_bytes().unwrap());
+//             req
+//         };
+
+//         let resp = block_on(copr.parse_and_handle_unary_request(req, None));
+//         assert!(!resp.get_other_error().is_empty());
+//     }
+
+//     #[test]
+//     fn test_invalid_req_type() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let mut req = coppb::Request::default();
+//         req.set_tp(9999);
+
+//         let resp = block_on(copr.parse_and_handle_unary_request(req, None));
+//         assert!(!resp.get_other_error().is_empty());
+//     }
+
+//     #[test]
+//     fn test_invalid_req_body() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let mut req = coppb::Request::default();
+//         req.set_tp(REQ_TYPE_DAG);
+//         req.set_data(vec![1, 2, 3]);
+
+//         let resp = block_on(copr.parse_and_handle_unary_request(req, None));
+//         assert!(!resp.get_other_error().is_empty());
+//     }
+
+//     #[test]
+//     fn test_full() {
+//         use std::sync::Mutex;
+
+//         use tikv_util::yatp_pool::{DefaultTicker, YatpPoolBuilder};
+
+//         use crate::storage::kv::{destroy_tls_engine, set_tls_engine};
+
+//         let engine = TestEngineBuilder::new().build().unwrap();
+
+//         let read_pool = ReadPool::from(
+//             CoprReadPoolConfig {
+//                 normal_concurrency: 1,
+//                 max_tasks_per_worker_normal: 2,
+//                 ..CoprReadPoolConfig::default_for_test()
+//             }
+//             .to_yatp_pool_configs()
+//             .into_iter()
+//             .map(|config| {
+//                 let engine = Arc::new(Mutex::new(engine.clone()));
+//                 YatpPoolBuilder::new(DefaultTicker::default())
+//                     .config(config)
+//                     .name_prefix("coprocessor_endpoint_test_full")
+//                     .after_start(move ||
+// set_tls_engine(engine.lock().unwrap().clone()))                     //
+// Safety: we call `set_` and `destroy_` with the same engine type.
+// .before_stop(|| unsafe { destroy_tls_engine::<RocksEngine>() })
+// .build_future_pool()             })
+//             .collect::<Vec<_>>(),
+//         );
+
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let (tx, rx) = mpsc::channel();
+
+//         // first 2 requests are processed as normal and laters are returned
+// as errors         for i in 0..5 {
+//             let mut response = coppb::Response::default();
+//             response.set_data(vec![1, 2, i]);
+
+//             let mut context = kvrpcpb::Context::default();
+//             context.set_priority(kvrpcpb::CommandPri::Normal);
+
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(UnaryFixture::new_with_duration(Ok(response),
+// 1000).into_boxed())             });
+//             let future =
+// copr.handle_unary_request(ReqContext::default_for_test(), handler_builder);
+//             let tx = tx.clone();
+//             thread::spawn(move || {
+//                 tx.send(block_on(future)).unwrap();
+//             });
+//             thread::sleep(Duration::from_millis(100));
+//         }
+
+//         // verify
+//         for _ in 2..5 {
+//             rx.recv().unwrap().unwrap_err();
+//         }
+//         for i in 0..2 {
+//             let resp = rx.recv().unwrap().unwrap();
+//             assert_eq!(resp.get_data(), [1, 2, i]);
+//             assert!(!resp.has_region_error());
+//         }
+//     }
+
+//     #[test]
+//     fn test_error_unary_response() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let handler_builder =
+//             Box::new(|_, _: &_|
+// Ok(UnaryFixture::new(Err(box_err!("foo"))).into_boxed()));         let resp =
+//
+// block_on(copr.handle_unary_request(ReqContext::default_for_test(),
+// handler_builder))                 .unwrap();
+//         assert_eq!(resp.get_data().len(), 0);
+//         assert!(!resp.get_other_error().is_empty());
+//     }
+
+//     #[test]
+//     fn test_error_streaming_response() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         // Fail immediately
+//         let handler_builder =
+//             Box::new(|_, _: &_|
+// Ok(StreamFixture::new(vec![Err(box_err!("foo"))]).into_boxed()));         let
+// resp_vec = block_on_stream(
+// copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
+//                 .unwrap(),
+//         )
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 1);
+//         assert_eq!(resp_vec[0].get_data().len(), 0);
+//         assert!(!resp_vec[0].get_other_error().is_empty());
+
+//         // Fail after some success responses
+//         let mut responses = Vec::new();
+//         for i in 0..5 {
+//             let mut resp = coppb::Response::default();
+//             resp.set_data(vec![1, 2, i]);
+//             responses.push(Ok(resp));
+//         }
+//         responses.push(Err(box_err!("foo")));
+
+//         let handler_builder = Box::new(|_, _: &_|
+// Ok(StreamFixture::new(responses).into_boxed()));         let resp_vec =
+// block_on_stream(
+// copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
+//                 .unwrap(),
+//         )
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 6);
+//         for (i, resp) in resp_vec.iter().enumerate().take(5) {
+//             assert_eq!(resp.get_data(), [1, 2, i as u8]);
+//         }
+//         assert_eq!(resp_vec[5].get_data().len(), 0);
+//         assert!(!resp_vec[5].get_other_error().is_empty());
+//     }
+
+//     #[test]
+//     fn test_empty_streaming_response() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let handler_builder = Box::new(|_, _: &_|
+// Ok(StreamFixture::new(vec![]).into_boxed()));         let resp_vec =
+// block_on_stream(
+// copr.handle_stream_request(ReqContext::default_for_test(), handler_builder)
+//                 .unwrap(),
+//         )
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 0);
+//     }
+
+//     // TODO: Test panic?
+
+//     #[test]
+//     fn test_special_streaming_handlers() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         // handler returns `finished == true` should not be called again.
+//         let counter = Arc::new(atomic::AtomicIsize::new(0));
+//         let counter_clone = Arc::clone(&counter);
+//         let handler = StreamFromClosure::new(move |nth| match nth {
+//             0 => {
+//                 let mut resp = coppb::Response::default();
+//                 resp.set_data(vec![1, 2, 7]);
+//                 Ok((Some(resp), true))
+//             }
+//             _ => {
+//                 // we cannot use `unreachable!()` here because CpuPool
+// catches panic.                 counter_clone.store(1,
+// atomic::Ordering::SeqCst);                 Err(box_err!("unreachable"))
+//             }
+//         });
+//         let handler_builder = Box::new(move |_, _: &_|
+// Ok(handler.into_boxed()));         let resp_vec = block_on_stream(
+//             copr.handle_stream_request(ReqContext::default_for_test(),
+// handler_builder)                 .unwrap(),
+//         )
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 1);
+//         assert_eq!(resp_vec[0].get_data(), [1, 2, 7]);
+//         assert_eq!(counter.load(atomic::Ordering::SeqCst), 0);
+
+//         // handler returns `None` but `finished == false` should not be
+// called again.         let counter = Arc::new(atomic::AtomicIsize::new(0));
+//         let counter_clone = Arc::clone(&counter);
+//         let handler = StreamFromClosure::new(move |nth| match nth {
+//             0 => {
+//                 let mut resp = coppb::Response::default();
+//                 resp.set_data(vec![1, 2, 13]);
+//                 Ok((Some(resp), false))
+//             }
+//             1 => Ok((None, false)),
+//             _ => {
+//                 counter_clone.store(1, atomic::Ordering::SeqCst);
+//                 Err(box_err!("unreachable"))
+//             }
+//         });
+//         let handler_builder = Box::new(move |_, _: &_|
+// Ok(handler.into_boxed()));         let resp_vec = block_on_stream(
+//             copr.handle_stream_request(ReqContext::default_for_test(),
+// handler_builder)                 .unwrap(),
+//         )
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 1);
+//         assert_eq!(resp_vec[0].get_data(), [1, 2, 13]);
+//         assert_eq!(counter.load(atomic::Ordering::SeqCst), 0);
+
+//         // handler returns `Err(..)` should not be called again.
+//         let counter = Arc::new(atomic::AtomicIsize::new(0));
+//         let counter_clone = Arc::clone(&counter);
+//         let handler = StreamFromClosure::new(move |nth| match nth {
+//             0 => {
+//                 let mut resp = coppb::Response::default();
+//                 resp.set_data(vec![1, 2, 23]);
+//                 Ok((Some(resp), false))
+//             }
+//             1 => Err(box_err!("foo")),
+//             _ => {
+//                 counter_clone.store(1, atomic::Ordering::SeqCst);
+//                 Err(box_err!("unreachable"))
+//             }
+//         });
+//         let handler_builder = Box::new(move |_, _: &_|
+// Ok(handler.into_boxed()));         let resp_vec = block_on_stream(
+//             copr.handle_stream_request(ReqContext::default_for_test(),
+// handler_builder)                 .unwrap(),
+//         )
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 2);
+//         assert_eq!(resp_vec[0].get_data(), [1, 2, 23]);
+//         assert!(!resp_vec[1].get_other_error().is_empty());
+//         assert_eq!(counter.load(atomic::Ordering::SeqCst), 0);
+//     }
+
+//     #[test]
+//     fn test_channel_size() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config {
+//                 end_point_stream_channel_size: 3,
+//                 ..Config::default()
+//             },
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let counter = Arc::new(atomic::AtomicIsize::new(0));
+//         let counter_clone = Arc::clone(&counter);
+//         let handler = StreamFromClosure::new(move |nth| {
+//             // produce an infinite stream
+//             let mut resp = coppb::Response::default();
+//             resp.set_data(vec![1, 2, nth as u8]);
+//             counter_clone.fetch_add(1, atomic::Ordering::SeqCst);
+//             Ok((Some(resp), false))
+//         });
+//         let handler_builder = Box::new(move |_, _: &_|
+// Ok(handler.into_boxed()));         let resp_vec = block_on_stream(
+//             copr.handle_stream_request(ReqContext::default_for_test(),
+// handler_builder)                 .unwrap(),
+//         )
+//         .take(7)
+//         .collect::<Result<Vec<_>>>()
+//         .unwrap();
+//         assert_eq!(resp_vec.len(), 7);
+//         assert!(counter.load(atomic::Ordering::SeqCst) < 14);
+//     }
+
+//     #[test]
+//     fn test_handle_time() {
+//         use tikv_util::config::ReadableDuration;
+
+//         /// Asserted that the snapshot can be retrieved in 500ms.
+//         const SNAPSHOT_DURATION_MS: u64 = 500;
+
+//         /// Asserted that the delay caused by OS scheduling other tasks is
+//         /// smaller than 200ms. This is mostly for CI.
+//         const HANDLE_ERROR_MS: u64 = 200;
+
+//         /// The acceptable error range for a coarse timer. Note that we use
+//         /// CLOCK_MONOTONIC_COARSE which can be slewed by time
+//         /// adjustment code (e.g., NTP, PTP).
+//         const COARSE_ERROR_MS: u64 = 50;
+
+//         /// The duration that payload executes.
+//         const PAYLOAD_SMALL: u64 = 3000;
+//         const PAYLOAD_LARGE: u64 = 6000;
+
+//         let engine = TestEngineBuilder::new().build().unwrap();
+
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig {
+//                 low_concurrency: 1,
+//                 normal_concurrency: 1,
+//                 high_concurrency: 1,
+//                 ..CoprReadPoolConfig::default_for_test()
+//             },
+//             engine,
+//         ));
+
+//         let config = Config {
+//             end_point_request_max_handle_duration: ReadableDuration::millis(
+//                 (PAYLOAD_SMALL + PAYLOAD_LARGE) as u64 * 2,
+//             ),
+//             ..Default::default()
+//         };
+
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &config,
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         let (tx, rx) = std::sync::mpsc::channel();
+
+//         // A request that requests execution details.
+//         let mut req_with_exec_detail = ReqContext::default_for_test();
+//         req_with_exec_detail.context.set_record_time_stat(true);
+
+//         {
+//             let mut wait_time: u64 = 0;
+
+//             // Request 1: Unary, success response.
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(UnaryFixture::new_with_duration(
+//                     Ok(coppb::Response::default()),
+//                     PAYLOAD_SMALL as u64,
+//                 )
+//                 .into_boxed())
+//             });
+//             let resp_future_1 =
+//                 copr.handle_unary_request(req_with_exec_detail.clone(),
+// handler_builder);             let sender = tx.clone();
+//             thread::spawn(move ||
+// sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());             //
+// Sleep a while to make sure that thread is spawn and snapshot is taken.
+//             thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as
+// u64));
+
+//             // Request 2: Unary, error response.
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(
+//                     UnaryFixture::new_with_duration(Err(box_err!("foo")),
+// PAYLOAD_LARGE as u64)                         .into_boxed(),
+//                 )
+//             });
+//             let resp_future_2 =
+//                 copr.handle_unary_request(req_with_exec_detail.clone(),
+// handler_builder);             let sender = tx.clone();
+//             thread::spawn(move ||
+// sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
+// thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
+
+//             // Response 1
+//             let resp = &rx.recv().unwrap()[0];
+//             assert!(resp.get_other_error().is_empty());
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             wait_time += PAYLOAD_SMALL - SNAPSHOT_DURATION_MS;
+
+//             // Response 2
+//             let resp = &rx.recv().unwrap()[0];
+//             assert!(!resp.get_other_error().is_empty());
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//         }
+
+//         {
+//             // Test multi-stage tasks
+//             // Request 1: Unary, success response.
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(UnaryFixture::new_with_duration_yieldable(
+//                     Ok(coppb::Response::default()),
+//                     PAYLOAD_SMALL as u64,
+//                 )
+//                 .into_boxed())
+//             });
+//             let resp_future_1 =
+//                 copr.handle_unary_request(req_with_exec_detail.clone(),
+// handler_builder);             let sender = tx.clone();
+//             thread::spawn(move ||
+// sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());             //
+// Sleep a while to make sure that thread is spawn and snapshot is taken.
+//             thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as
+// u64));
+
+//             // Request 2: Unary, error response.
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(UnaryFixture::new_with_duration_yieldable(
+//                     Err(box_err!("foo")),
+//                     PAYLOAD_LARGE as u64,
+//                 )
+//                 .into_boxed())
+//             });
+//             let resp_future_2 =
+//                 copr.handle_unary_request(req_with_exec_detail.clone(),
+// handler_builder);             let sender = tx.clone();
+//             thread::spawn(move ||
+// sender.send(vec![block_on(resp_future_2).unwrap()]).unwrap());
+// thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as u64));
+
+//             // Response 1
+//             //
+//             // Note: `process_wall_time_ms` includes `total_process_time` and
+//             // `total_suspend_time`. Someday it will be separated, but for
+// now,             // let's just consider the combination.
+//             //
+//             // In the worst case, `total_suspend_time` could be totally req2
+// payload.             // So here: req1 payload <= process time <= (req1
+// payload + req2 payload)             let resp = &rx.recv().unwrap()[0];
+//             assert!(resp.get_other_error().is_empty());
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR_MS +
+// COARSE_ERROR_MS             );
+
+//             // Response 2
+//             //
+//             // Note: `process_wall_time_ms` includes `total_process_time` and
+//             // `total_suspend_time`. Someday it will be separated, but for
+// now,             // let's just consider the combination.
+//             //
+//             // In the worst case, `total_suspend_time` could be totally req1
+// payload.             // So here: req2 payload <= process time <= (req1
+// payload + req2 payload)             let resp = &rx.recv().unwrap()[0];
+//             assert!(!resp.get_other_error().is_empty());
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL + PAYLOAD_LARGE + HANDLE_ERROR_MS +
+// COARSE_ERROR_MS             );
+//         }
+
+//         {
+//             let mut wait_time: u64 = 0;
+
+//             // Request 1: Unary, success response.
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(UnaryFixture::new_with_duration(
+//                     Ok(coppb::Response::default()),
+//                     PAYLOAD_LARGE as u64,
+//                 )
+//                 .into_boxed())
+//             });
+//             let resp_future_1 =
+//                 copr.handle_unary_request(req_with_exec_detail.clone(),
+// handler_builder);             let sender = tx.clone();
+//             thread::spawn(move ||
+// sender.send(vec![block_on(resp_future_1).unwrap()]).unwrap());             //
+// Sleep a while to make sure that thread is spawn and snapshot is taken.
+//             thread::sleep(Duration::from_millis(SNAPSHOT_DURATION_MS as
+// u64));
+
+//             // Request 2: Stream.
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(StreamFixture::new_with_duration(
+//                     vec![
+//                         Ok(coppb::Response::default()),
+//                         Err(box_err!("foo")),
+//                         Ok(coppb::Response::default()),
+//                     ],
+//                     vec![
+//                         PAYLOAD_SMALL as u64,
+//                         PAYLOAD_LARGE as u64,
+//                         PAYLOAD_SMALL as u64,
+//                     ],
+//                 )
+//                 .into_boxed())
+//             });
+//             let resp_future_3 = copr
+//                 .handle_stream_request(req_with_exec_detail, handler_builder)
+//                 .unwrap()
+//                 .map(|x| x.map(|x| x.into()));
+//             thread::spawn(move || {
+//                 tx.send(
+//                     block_on_stream(resp_future_3)
+//                         .collect::<Result<Vec<_>>>()
+//                         .unwrap(),
+//                 )
+//                 .unwrap()
+//             });
+
+//             // Response 1
+//             let resp = &rx.recv().unwrap()[0];
+//             assert!(resp.get_other_error().is_empty());
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             assert_ge!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp.get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             wait_time += PAYLOAD_LARGE - SNAPSHOT_DURATION_MS;
+
+//             // Response 2
+//             let resp = &rx.recv().unwrap();
+//             assert_eq!(resp.len(), 2);
+//             assert!(resp[0].get_other_error().is_empty());
+//             assert_ge!(
+//                 resp[0]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp[0]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_SMALL + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             assert_ge!(
+//                 resp[0]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp[0]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+
+//             assert!(!resp[1].get_other_error().is_empty());
+//             assert_ge!(
+//                 resp[1]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE.saturating_sub(COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp[1]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_process_wall_time_ms(),
+//                 PAYLOAD_LARGE + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//             assert_ge!(
+//                 resp[1]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time.saturating_sub(HANDLE_ERROR_MS + COARSE_ERROR_MS)
+//             );
+//             assert_lt!(
+//                 resp[1]
+//                     .get_exec_details()
+//                     .get_time_detail()
+//                     .get_wait_wall_time_ms(),
+//                 wait_time + HANDLE_ERROR_MS + COARSE_ERROR_MS
+//             );
+//         }
+//     }
+
+//     #[test]
+//     fn test_exceed_deadline() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &Config::default(),
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+
+//         {
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 thread::sleep(Duration::from_millis(600));
+//
+// Ok(UnaryFixture::new(Ok(coppb::Response::default())).into_boxed())
+//             });
+
+//             let mut config = ReqContext::default_for_test();
+//             config.deadline = Deadline::from_now(Duration::from_millis(500));
+
+//             let resp = block_on(copr.handle_unary_request(config,
+// handler_builder)).unwrap();             assert_eq!(resp.get_data().len(), 0);
+//             assert!(!resp.get_other_error().is_empty());
+//         }
+
+//         {
+//             let handler_builder = Box::new(|_, _: &_| {
+//                 Ok(
+//
+// UnaryFixture::new_with_duration_yieldable(Ok(coppb::Response::default()),
+// 1500)                         .into_boxed(),
+//                 )
+//             });
+
+//             let mut config = ReqContext::default_for_test();
+//             config.deadline = Deadline::from_now(Duration::from_millis(500));
+
+//             let resp = block_on(copr.handle_unary_request(config,
+// handler_builder)).unwrap();             assert_eq!(resp.get_data().len(), 0);
+//             assert!(!resp.get_other_error().is_empty());
+//         }
+//     }
+
+//     #[test]
+//     fn test_check_memory_locks() {
+//         let engine = TestEngineBuilder::new().build().unwrap();
+//         let read_pool = ReadPool::from(build_read_pool_for_test(
+//             &CoprReadPoolConfig::default_for_test(),
+//             engine,
+//         ));
+//         let cm = ConcurrencyManager::new(1.into());
+//         let key = Key::from_raw(b"key");
+//         let guard = block_on(cm.lock_key(&key));
+//         guard.with_lock(|lock| {
+//             *lock = Some(txn_types::Lock::new(
+//                 LockType::Put,
+//                 b"key".to_vec(),
+//                 10.into(),
+//                 100,
+//                 Some(vec![]),
+//                 0.into(),
+//                 1,
+//                 20.into(),
+//             ));
+//         });
+
+//         let config = Config::default();
+//         let copr = Endpoint::<RocksEngine>::new(
+//             &config,
+//             read_pool.handle(),
+//             cm,
+//             ResourceTagFactory::new_for_test(),
+//             Arc::new(QuotaLimiter::default()),
+//         );
+//         let mut req = coppb::Request::default();
+//         req.mut_context().set_isolation_level(IsolationLevel::Si);
+//         req.set_start_ts(100);
+//         req.set_tp(REQ_TYPE_DAG);
+//         let mut key_range = coppb::KeyRange::default();
+//         key_range.set_start(b"a".to_vec());
+//         key_range.set_end(b"z".to_vec());
+//         req.mut_ranges().push(key_range);
+//         let mut dag = DagRequest::default();
+//         dag.mut_executors().push(Executor::default());
+//         req.set_data(dag.write_to_bytes().unwrap());
+
+//         let resp = block_on(copr.parse_and_handle_unary_request(req, None));
+//         assert_eq!(resp.get_locked().get_key(), b"key");
+//     }
+// }

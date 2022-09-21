@@ -18,6 +18,7 @@ use engine_traits::{CfName, KvEngine, MvccProperties, Snapshot};
 use kvproto::{
     errorpb,
     kvrpcpb::{Context, IsolationLevel},
+    metapb,
     raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse, RaftRequestHeader, Request, Response},
 };
 use raft::{
@@ -327,6 +328,18 @@ where
 
     fn kv_engine(&self) -> Option<E> {
         Some(self.engine.clone())
+    }
+
+    fn snapshot_on_kv_engine(&self, start_key: &[u8], end_key: &[u8]) -> kv::Result<Self::Snap> {
+        let mut region = metapb::Region::default();
+        region.set_start_key(start_key.to_owned());
+        region.set_end_key(end_key.to_owned());
+        // Use a fake peer to avoid panic.
+        region.mut_peers().push(Default::default());
+        Ok(RegionSnapshot::<E::Snapshot>::from_raw(
+            self.engine.clone(),
+            region,
+        ))
     }
 
     fn modify_on_kv_engine(

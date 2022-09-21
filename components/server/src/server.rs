@@ -909,13 +909,13 @@ where
             &server_config,
             &self.security_mgr,
             storage,
-            coprocessor::Endpoint::new(
+            Arc::new(coprocessor::Endpoint::new(
                 &server_config.value(),
                 cop_read_pool_handle,
                 self.concurrency_manager.clone(),
                 resource_tag_factory,
                 Arc::clone(&self.quota_limiter),
-            ),
+            )),
             coprocessor_v2::Endpoint::new(&self.config.coprocessor_v2),
             self.router.clone(),
             self.resolver.clone(),

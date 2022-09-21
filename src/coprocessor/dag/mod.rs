@@ -9,7 +9,7 @@ use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::Message;
 use tidb_query_common::{execute_stats::ExecSummary, storage::IntervalRange};
 use tikv_alloc::trace::MemoryTraceGuard;
-use tipb::{DagRequest, SelectResponse, StreamResponse};
+use tipb::{DagRequest, FieldType, SelectResponse, StreamResponse, TableScan};
 
 pub use self::storage_impl::TikvStorage;
 use crate::{
@@ -84,11 +84,12 @@ impl<S: Store + 'static> DagHandlerBuilder<S> {
 pub struct BatchDagHandler {
     runner: tidb_query_executors::runner::BatchExecutorsRunner<Statistics>,
     data_version: Option<u64>,
+    index_lookup: Option<TableScan>,
 }
 
 impl BatchDagHandler {
     pub fn new<S: Store + 'static>(
-        req: DagRequest,
+        mut req: DagRequest,
         ranges: Vec<KeyRange>,
         store: S,
         data_version: Option<u64>,
@@ -99,6 +100,9 @@ impl BatchDagHandler {
         paging_size: Option<u64>,
         quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
+        let index_lookup = req
+            .has_extra_table_info()
+            .then(|| req.take_extra_table_info());
         Ok(Self {
             runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request(
                 req,
@@ -111,6 +115,7 @@ impl BatchDagHandler {
                 quota_limiter,
             )?,
             data_version,
+            index_lookup,
         })
     }
 }
@@ -132,6 +137,12 @@ impl RequestHandler for BatchDagHandler {
 
     fn collect_scan_summary(&mut self, dest: &mut ExecSummary) {
         self.runner.collect_scan_summary(dest);
+    }
+
+    fn index_lookup(&self) -> Option<(Vec<FieldType>, TableScan)> {
+        self.index_lookup
+            .as_ref()
+            .map(|index_lookup| (self.runner.schema().to_vec(), index_lookup.clone()))
     }
 }
 

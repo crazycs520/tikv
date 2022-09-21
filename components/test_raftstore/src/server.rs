@@ -465,13 +465,13 @@ impl ServerCluster {
             &tikv::config::CoprReadPoolConfig::default_for_test(),
             store.get_engine(),
         ));
-        let copr = coprocessor::Endpoint::new(
+        let copr = Arc::new(coprocessor::Endpoint::new(
             &server_cfg.value().clone(),
             cop_read_pool.handle(),
             concurrency_manager.clone(),
             res_tag_factory,
             quota_limiter,
-        );
+        ));
         let copr_v2 = coprocessor_v2::Endpoint::new(&cfg.coprocessor_v2);
         let mut server = None;
         // Create Debug service.
