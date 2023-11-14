@@ -316,8 +316,9 @@ impl LeadershipResolver {
         for region_id in &regions {
             checking_regions.insert(*region_id);
         }
-        let min_timeout: Duration =
-            cmp::min(DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, advance_ts_interval);
+        let min_timeout = DEFAULT_CHECK_LEADER_TIMEOUT_DURATION;
+        // let min_timeout: Duration =
+        //     cmp::min(DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, advance_ts_interval);
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 if !checking_regions.contains(region_id) {
@@ -417,7 +418,7 @@ impl LeadershipResolver {
                 });
 
                 let rand_v: u64 = rand::thread_rng().gen();
-                if (rand_v % 100) == 1 {
+                if to_store == 2 && (rand_v % 100) == 1 {
                     info!(
                         "inject sleep in check_leader rpc";
                     );
