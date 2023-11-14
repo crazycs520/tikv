@@ -292,8 +292,6 @@ impl LeadershipResolver {
         min_ts: TimeStamp,
         advance_ts_interval: Duration,
     ) -> Vec<u64> {
-        use rand::Rng;
-
         if regions.is_empty() {
             return regions;
         }
@@ -316,8 +314,10 @@ impl LeadershipResolver {
         for region_id in &regions {
             checking_regions.insert(*region_id);
         }
-        let min_timeout: Duration =
-            cmp::min(DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, advance_ts_interval);
+
+        let min_timeout: Duration = DEFAULT_CHECK_LEADER_TIMEOUT_DURATION;
+        // let min_timeout: Duration =
+        //     cmp::min(DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, advance_ts_interval);
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 if !checking_regions.contains(region_id) {
@@ -415,15 +415,6 @@ impl LeadershipResolver {
                         .with_label_values(&["rpc"])
                         .observe(elapsed.as_secs_f64());
                 });
-
-                let rand_v: u64 = rand::thread_rng().gen();
-                if to_store == 2 && (rand_v % 100) == 1 {
-                    info!(
-                        "inject sleep in check_leader rpc";
-                    );
-                    std::thread::sleep(min_timeout);
-                    return Err((to_store, true, format!("[rpc mock timeout]{:?}", min_timeout)));
-                }
 
                 let rpc = match client.check_leader_async(req) {
                     Ok(rpc) => rpc,

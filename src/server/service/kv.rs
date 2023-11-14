@@ -943,6 +943,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let (cb, resp) = paired_future_callback();
         let check_leader_scheduler = self.check_leader_scheduler.clone();
         let task = async move {
+            fail::fail_point!("check_leader_handler");
             check_leader_scheduler
                 .schedule(CheckLeaderTask::CheckLeader { leaders, cb })
                 .map_err(|e| Error::Other(format!("{}", e).into()))?;
