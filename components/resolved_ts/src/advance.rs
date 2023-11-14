@@ -422,6 +422,7 @@ impl LeadershipResolver {
                         "inject sleep in check_leader rpc";
                     );
                     std::thread::sleep(min_timeout);
+                    return Err((to_store, true, format!("[rpc mock timeout]{:?}", min_timeout)));
                 }
 
                 let rpc = match client.check_leader_async(req) {
