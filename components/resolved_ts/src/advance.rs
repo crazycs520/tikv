@@ -292,6 +292,8 @@ impl LeadershipResolver {
         min_ts: TimeStamp,
         advance_ts_interval: Duration,
     ) -> Vec<u64> {
+        use rand::Rng;
+
         if regions.is_empty() {
             return regions;
         }
@@ -413,6 +415,14 @@ impl LeadershipResolver {
                         .with_label_values(&["rpc"])
                         .observe(elapsed.as_secs_f64());
                 });
+
+                let rand_v: u64 = rand::thread_rng().gen();
+                if (rand_v % 100) == 1 {
+                    info!(
+                        "inject sleep in check_leader rpc";
+                    );
+                    std::thread::sleep(min_timeout);
+                }
 
                 let rpc = match client.check_leader_async(req) {
                     Ok(rpc) => rpc,
