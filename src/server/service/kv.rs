@@ -930,7 +930,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     ) {
         unimplemented!()
     }
-
     fn check_leader(
         &mut self,
         ctx: RpcContext<'_>,
@@ -943,7 +942,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let (cb, resp) = paired_future_callback();
         let check_leader_scheduler = self.check_leader_scheduler.clone();
         let task = async move {
-            fail::fail_point!("check_leader_handler");
+            let delay = (|| -> u64 {
+                fail_point!("check_leader_slow", |x| { x.map_or(0, |s| s.parse::<u64>().unwrap_or(0)) });
+                0
+            })();
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
             check_leader_scheduler
                 .schedule(CheckLeaderTask::CheckLeader { leaders, cb })
                 .map_err(|e| Error::Other(format!("{}", e).into()))?;
