@@ -950,10 +950,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             })();
             if delay > 0 {
                 let dur = std::time::Duration::from_millis(delay);
-                for _ in 0..dur.as_millis() as u64 {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    yatp::task::future::reschedule().await;
-                }
+                let _ = tikv_util::timer::SteadyTimer::default().delay(dur).compat().await;
             }
             check_leader_scheduler
                 .schedule(CheckLeaderTask::CheckLeader { leaders, cb })
