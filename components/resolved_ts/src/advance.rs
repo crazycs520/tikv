@@ -315,9 +315,8 @@ impl LeadershipResolver {
             checking_regions.insert(*region_id);
         }
 
-        let min_timeout: Duration = DEFAULT_CHECK_LEADER_TIMEOUT_DURATION;
-        // let min_timeout: Duration =
-        //     cmp::min(DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, advance_ts_interval);
+        let min_timeout: Duration =
+            cmp::min(DEFAULT_CHECK_LEADER_TIMEOUT_DURATION, advance_ts_interval);
         self.region_read_progress.with(|registry| {
             for (region_id, read_progress) in registry {
                 if !checking_regions.contains(region_id) {

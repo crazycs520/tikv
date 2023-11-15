@@ -943,7 +943,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let check_leader_scheduler = self.check_leader_scheduler.clone();
         let task = async move {
             let delay = (|| -> u64 {
-                fail_point!("check_leader_slow", |x| { x.map_or(0, |s| s.parse::<u64>().unwrap_or(0)) });
+                fail_point!("check_leader_slow", |x| {
+                    x.map_or(0, |s| s.parse::<u64>().unwrap_or(0))
+                });
                 0
             })();
             if delay > 0 {
