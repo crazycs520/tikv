@@ -3247,6 +3247,10 @@ where
                 GLOBAL_TRACKERS.with_tracker(tracker, |t| {
                     t.metrics.read_index_confirm_wait_nanos =
                         (time - read.propose_time).to_std().unwrap().as_nanos() as u64;
+                    if let Some(wait_ready_time) = read.wait_ready_time{
+                        t.metrics.read_index_wait_ready_nanos =
+                            (time - wait_ready_time).to_std().unwrap().as_nanos() as u64;
+                    }
                 })
             });
             // leader reports key is locked
@@ -3363,6 +3367,9 @@ where
                 self.respond_replica_read_error(&mut read, response);
             } else {
                 // TODO: `ReadIndex` requests could be blocked.
+                if read.wait_ready_time.is_none() {
+                    read.wait_ready_time = Some(monotonic_raw_now());
+                }
                 self.pending_reads.push_front(read);
                 break;
             }

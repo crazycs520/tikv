@@ -500,6 +500,7 @@ make_auto_flush_static_metric! {
         // and the time used for checking quorum (snapshot_read_index_confirm).
         snapshot_read_index_propose_wait,
         snapshot_read_index_confirm,
+        snapshot_read_index_wait_ready,
     }
 
     pub struct AsyncRequestsCounterVec: LocalIntCounter {
