@@ -32,7 +32,7 @@ pub struct ReadIndexRequest<C> {
     pub id: Uuid,
     cmds: MustConsumeVec<(RaftCmdRequest, C, Option<u64>)>,
     pub propose_time: Timespec,
-    pub wait_ready_time: Option<Timespec>,
+    pub wait_ready_time: Option<(Timespec, String)>,
     pub read_index: Option<u64>,
     pub addition_request: Option<Box<raft_cmdpb::ReadIndexRequest>>,
     pub locked: Option<Box<LockInfo>>,

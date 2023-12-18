@@ -693,12 +693,11 @@ where
                                     );
                             }
                             if tracker.metrics.read_index_wait_ready_nanos > 0 {
-                                ASYNC_REQUESTS_DURATIONS_VEC
-                                    .snapshot_read_index_wait_ready
-                                    .observe(
-                                        tracker.metrics.read_index_wait_ready_nanos as f64
-                                            / 1_000_000_000.0,
-                                    );
+                                let label = "snapshot_read_index_wait_ready_".to_string()+tracker.metrics.read_index_wait_ready_reason.as_str();
+                                ASYNC_REQUESTS_DURATIONS.with_label_values(&[label.as_str()]).observe(
+                                    tracker.metrics.read_index_wait_ready_nanos as f64
+                                                / 1_000_000_000.0,
+                                );
                             }
                         } else if tracker.metrics.local_read {
                             ASYNC_REQUESTS_DURATIONS_VEC
