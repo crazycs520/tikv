@@ -168,6 +168,7 @@ pub struct RaftMetrics {
     pub commit_log: LocalHistogram,
     pub write_block_wait: LocalHistogram,
     pub propose_log_size: LocalHistogram,
+    pub read_index_leader_lease_invalid: LocalIntCounter,
 
     // waterfall metrics
     pub waterfall_metrics: bool,
@@ -211,6 +212,7 @@ impl RaftMetrics {
             commit_log: PEER_COMMIT_LOG_HISTOGRAM.local(),
             write_block_wait: STORE_WRITE_MSG_BLOCK_WAIT_DURATION_HISTOGRAM.local(),
             propose_log_size: PEER_PROPOSE_LOG_SIZE_HISTOGRAM.local(),
+            read_index_leader_lease_invalid: READ_INDEX_LEADER_LEASE_INVALID.local(),
             waterfall_metrics,
             wf_batch_wait: STORE_WF_BATCH_WAIT_DURATION_HISTOGRAM.local(),
             wf_send_to_queue: STORE_WF_SEND_TO_QUEUE_DURATION_HISTOGRAM.local(),

@@ -680,6 +680,12 @@ lazy_static! {
             &["type"]
         ).unwrap();
 
+    pub static ref READ_INDEX_LEADER_LEASE_INVALID: IntCounter = register_int_counter!(
+        "tikv_raftstore_read_index_leader_lease_invalid",
+        "Total number of checking stale peers."
+    ).unwrap();
+
+
     pub static ref RAFT_EVENT_DURATION_VEC: HistogramVec =
         register_histogram_vec!(
             "tikv_raftstore_event_duration",

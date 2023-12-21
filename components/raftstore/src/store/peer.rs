@@ -1818,6 +1818,7 @@ where
                     return Ok(());
                 }
                 self.should_wake_up = state == LeaseState::Expired;
+                ctx.raft_metrics.read_index_leader_lease_invalid.inc();
             }
         } else if util::is_vote_msg(&m) {
             // Only by passing an election timeout can peers handle request vote safely.
