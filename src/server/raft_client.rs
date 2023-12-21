@@ -8,12 +8,11 @@ use std::{
     pin::Pin,
     result,
     sync::{
-        atomic::{AtomicI32, AtomicU8, Ordering},
+        atomic::{AtomicI32, AtomicPtr, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
-use std::sync::atomic::AtomicPtr;
 
 use collections::{HashMap, HashSet};
 use crossbeam::queue::ArrayQueue;
@@ -122,11 +121,9 @@ impl Queue {
         match self.conn_state.load(Ordering::SeqCst).into() {
             ConnState::Established => match self.buf.push(msg) {
                 Ok(()) => {
-                    if self.begin_wait.load(Ordering::SeqCst).is_null(){
-                        self.begin_wait.store(Box::into_raw(Box::new(Instant::now())), Ordering::SeqCst);
-                    }
+                    self.record_begin_wait();
                     Ok(())
-                },
+                }
                 Err(_) => Err(DiscardReason::Full),
             },
             ConnState::Paused => Err(DiscardReason::Paused),
@@ -175,7 +172,16 @@ impl Queue {
         })
     }
 
-    fn take_begin_wait(&self) -> Option<Instant>{
+    #[inline]
+    fn record_begin_wait(&self) {
+        if self.begin_wait.load(Ordering::SeqCst).is_null() {
+            self.begin_wait
+                .store(Box::into_raw(Box::new(Instant::now())), Ordering::SeqCst);
+        }
+    }
+
+    #[inline]
+    fn take_begin_wait(&self) -> Option<Instant> {
         let p = self.begin_wait.swap(std::ptr::null_mut(), Ordering::SeqCst);
         if !p.is_null() {
             unsafe { Some(*Box::from_raw(p)) }
@@ -555,7 +561,7 @@ where
                 // So either enough messages are batched up or don't need to wait or wait
                 // timeouts.
                 s.flush_timeout.take();
-                if let Some(begin_wait) = s.queue.take_begin_wait(){
+                if let Some(begin_wait) = s.queue.take_begin_wait() {
                     RAFT_MESSAGE_WAIT_FLUSH_HISTOGRAM.observe(begin_wait.elapsed().as_secs_f64());
                 }
                 ready!(Poll::Ready(s.buffer.flush(&mut s.sender)))?;
