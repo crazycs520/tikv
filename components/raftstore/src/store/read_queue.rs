@@ -32,7 +32,7 @@ pub struct ReadIndexRequest<C> {
     pub id: Uuid,
     cmds: MustConsumeVec<(RaftCmdRequest, C, Option<u64>)>,
     pub propose_time: Timespec,
-    pub wait_ready_time: Option<Timespec>,
+    pub wait_ready_time: Timespec,
     pub read_index: Option<u64>,
     pub addition_request: Option<Box<raft_cmdpb::ReadIndexRequest>>,
     pub locked: Option<Box<LockInfo>>,
@@ -63,7 +63,7 @@ impl<C> ReadIndexRequest<C> {
             id,
             cmds,
             propose_time,
-            wait_ready_time: None,
+            wait_ready_time: Timespec::new(0, 0),
             read_index: None,
             addition_request: None,
             locked: None,
@@ -217,10 +217,12 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
         T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64)>,
     {
         let mut states_iter = states.into_iter();
+        let now = monotonic_raw_now();
         while let Some((uuid, info, index)) = states_iter.next() {
             let invalid_id = match self.reads.get_mut(self.ready_cnt) {
                 Some(r) if r.id == uuid => {
                     r.read_index = Some(index);
+                    r.wait_ready_time = now;
                     self.ready_cnt += 1;
                     continue;
                 }
@@ -254,6 +256,7 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
         T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64)>,
     {
         let (mut min_changed_offset, mut max_changed_offset) = (usize::MAX, 0);
+        let now = monotonic_raw_now();
         for (uuid, locked, index) in states {
             if let Some(raw_offset) = self.contexts.remove(&uuid) {
                 let offset = match raw_offset.checked_sub(self.handled_cnt) {
@@ -278,6 +281,7 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
                     }
                 }
                 self.reads[offset].read_index = Some(index);
+                self.reads[offset].wait_ready_time = now;
                 min_changed_offset = cmp::min(min_changed_offset, offset);
                 max_changed_offset = cmp::max(max_changed_offset, offset);
                 continue;
@@ -298,11 +302,13 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
 
     fn fold(&mut self, min_changed_offset: usize, max_changed_offset: usize) {
         let mut r_idx = self.reads[max_changed_offset].read_index.unwrap();
+        let wait_ready_time = self.reads[max_changed_offset].wait_ready_time;
         let mut check_offset = max_changed_offset - 1;
         loop {
             let l_idx = self.reads[check_offset].read_index.unwrap_or(u64::MAX);
             if l_idx > r_idx {
                 self.reads[check_offset].read_index = Some(r_idx);
+                self.reads[check_offset].wait_ready_time = wait_ready_time;
             } else if check_offset < min_changed_offset {
                 break;
             } else {

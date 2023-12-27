@@ -698,12 +698,17 @@ where
                                     );
                             }
                             if tracker.metrics.read_index_wait_ready_nanos > 0 {
-                                ASYNC_REQUESTS_DURATIONS_VEC
-                                    .snapshot_read_index_wait_ready
-                                    .observe(
-                                        tracker.metrics.read_index_wait_ready_nanos as f64
-                                            / 1_000_000_000.0,
-                                    );
+                                let duration = tracker.metrics.read_index_wait_ready_nanos as f64
+                                    / 1_000_000_000.0;
+                                if tracker.metrics.read_in_leader {
+                                    ASYNC_REQUESTS_DURATIONS_VEC
+                                        .snapshot_read_index_wait_ready_in_leader
+                                        .observe(duration);
+                                } else {
+                                    ASYNC_REQUESTS_DURATIONS_VEC
+                                        .snapshot_read_index_wait_ready_in_follower
+                                        .observe(duration);
+                                }
                             }
                         } else if tracker.metrics.local_read {
                             ASYNC_REQUESTS_DURATIONS_VEC
