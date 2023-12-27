@@ -2722,6 +2722,20 @@ def Storage() -> RowPanel:
     )
     layout.row(
         heatmap_panel_graph_panel_histogram_quantile_pairs(
+            heatmap_title="Read index wait apply ready duration",
+            heatmap_description="Read index wait apply ready duration associated with async snapshot",
+            graph_title="Read index wait apply duration",
+            graph_description="Read index wait apply ready duration associated with async snapshot",
+            yaxis_format=UNITS.SECONDS,
+            metric="tikv_storage_engine_async_request_duration_seconds",
+            label_selectors=[
+                'type=~"snapshot_read_index_wait_ready_in_leader|snapshot_read_index_wait_ready_in_follower"'
+            ],
+            graph_by_labels=["type"],
+        ),
+    )
+    layout.row(
+        heatmap_panel_graph_panel_histogram_quantile_pairs(
             heatmap_title="Read index confirm duration",
             heatmap_description="Read index confirm duration associated with async snapshot",
             graph_title="Read index confirm duration",
