@@ -284,6 +284,10 @@ pub trait Engine: Send + Clone + 'static {
 
     fn async_snapshot(&self, ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> Result<()>;
 
+    fn locate_key(&self, _key: &[u8]) -> Option<u64> {
+        unimplemented!()
+    }
+
     /// Precheck request which has write with it's context.
     fn precheck_write_with_ctx(&self, _ctx: &Context) -> Result<()> {
         Ok(())

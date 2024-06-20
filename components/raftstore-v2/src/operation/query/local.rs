@@ -140,6 +140,10 @@ where
         }
         (meta.readers.len(), None)
     }
+
+    fn locate_key(&self, _key: &[u8]) -> Option<u64> {
+        return None;
+    }
 }
 
 #[cfg(test)]

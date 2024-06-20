@@ -638,6 +638,37 @@ impl<E: Engine> Endpoint<E> {
                         table_prefix.extend(RECORD_PREFIX_SEP);
 
                         if !all_data.is_empty() {
+                            // all_data.sort_by()
+                            for row in &all_data {
+                                let mut key;
+                                if schema_types.len() == 1
+                                    && matches!(
+                                        schema_types[0],
+                                        FieldTypeTp::Long | FieldTypeTp::LongLong
+                                    )
+                                {
+                                    let idx = match row[0] {
+                                        Datum::I64(x) => x,
+                                        Datum::U64(x) => x as i64,
+                                        _ => unreachable!(),
+                                    };
+                                    key = table_prefix.clone();
+                                    key.encode_i64(idx).unwrap();
+                                } else {
+                                    key = table_prefix.clone();
+                                    key.write_datum(&mut EvalContext::default(), row, true)
+                                        .unwrap();
+                                }
+                                let key = Key::from_raw(&key);
+                                if let Some(region_id) = unsafe {
+                                    with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
+                                } {
+                                    info!("index lookup locate key exist"; "key" => ?key.as_encoded(), "region" => region_id);
+                                } else {
+                                    info!("index lookup locate key not exist"; "key" => ?key.as_encoded());
+                                }
+                            }
+
                             let snapshot = unsafe {
                                 with_tls_engine(|e: &E| e.snapshot_on_kv_engine(&[], &[])).unwrap()
                             };

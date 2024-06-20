@@ -122,6 +122,10 @@ where
     ) -> RaftStoreResult<()>;
 
     fn release_snapshot_cache(&self);
+
+    fn locate_key(&self, _key: &[u8]) -> Option<u64>{
+        unimplemented!()
+    }
 }
 
 #[derive(Clone)]

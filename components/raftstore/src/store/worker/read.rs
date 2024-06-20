@@ -10,6 +10,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use std::collections::Bound::{Excluded, Unbounded};
 
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
 use engine_traits::{KvEngine, RaftEngine, Snapshot};
@@ -28,6 +29,7 @@ use tikv_util::{
     time::{monotonic_raw_now, ThreadReadId},
 };
 use time::Timespec;
+use keys::data_key;
 
 use super::metrics::*;
 use crate::{
@@ -235,6 +237,8 @@ where
     /// get the ReadDelegate with region_id and the number of delegates in the
     /// StoreMeta
     fn get_executor_and_len(&self, region_id: u64) -> (usize, Option<Self::Executor>);
+
+    fn locate_key(&self, key: &[u8]) -> Option<u64>;
 }
 
 #[derive(Clone)]
@@ -283,6 +287,22 @@ where
             );
         }
         (meta.readers.len(), None)
+    }
+
+    // locate_key returns region_id which contains the key.
+    fn locate_key(&self, key: &[u8]) -> Option<u64> {
+        let meta = self.store_meta.as_ref().lock().unwrap();
+        let start = Excluded(data_key(key));
+        let end = Unbounded::<Vec<u8>>;
+        for (key, id) in meta.region_ranges.range((start, end)){
+            if let Some(reader) =  meta.readers.get(id){
+                if util::check_key_in_region(key, &reader.region).is_ok(){
+                    return Some(*id);
+                }
+            }
+            return None;
+        }
+        return None;
     }
 }
 
@@ -855,6 +875,10 @@ where
     pub fn release_snapshot_cache(&mut self) {
         self.snap_cache.as_mut().take();
     }
+
+    // fn locate_key(&self, key: &[u8]) -> Option<u64> {
+    //     self.store_meta.locate_key(key)
+    // }
 }
 
 impl<C, E, D, S> Clone for LocalReader<C, E, D, S>

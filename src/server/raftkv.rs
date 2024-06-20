@@ -494,6 +494,9 @@ where
         })
     }
 
+    fn locate_key(&self, key: &[u8]) -> Option<u64> {
+        self.router.locate_key(key)
+    }
     fn release_snapshot(&self) {
         self.router.release_snapshot_cache();
     }
