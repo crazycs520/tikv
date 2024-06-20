@@ -876,9 +876,9 @@ where
         self.snap_cache.as_mut().take();
     }
 
-    // fn locate_key(&self, key: &[u8]) -> Option<u64> {
-    //     self.store_meta.locate_key(key)
-    // }
+    pub fn locate_key(&self, key: &[u8]) -> Option<u64> {
+        self.store_meta.locate_key(key)
+    }
 }
 
 impl<C, E, D, S> Clone for LocalReader<C, E, D, S>
