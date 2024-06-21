@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use std::cmp::{min, Ordering};
 
 use ::tracker::{
     set_tls_tracker_token, with_tls_tracker, RequestInfo, RequestType, GLOBAL_TRACKERS,
@@ -638,7 +639,18 @@ impl<E: Engine> Endpoint<E> {
                         table_prefix.extend(RECORD_PREFIX_SEP);
 
                         if !all_data.is_empty() {
-                            // all_data.sort_by()
+                            all_data.sort_by(|a,b|{
+                                let mut ctx = EvalContext::default();
+                                let l = min(a.len(), b.len());
+                                for i in 0..l {
+                                    if let Ok(ordering) = a[i].cmp(&mut ctx, &b[i]){
+                                        if ordering != Ordering::Equal{
+                                            return ordering;
+                                        }
+                                    }
+                                }
+                                return a.len().cmp(&b.len());
+                            });
                             for row in &all_data {
                                 let mut key;
                                 if schema_types.len() == 1
