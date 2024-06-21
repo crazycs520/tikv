@@ -267,7 +267,7 @@ impl<EK: KvEngine, ER: RaftEngine> LocalReadRouter<EK> for ServerRaftStoreRouter
     }
 
     fn locate_key(&self, key: &[u8]) -> Option<u64> {
-        let mut local_reader = self.local_reader.borrow_mut();
+        let local_reader = self.local_reader.borrow_mut();
         local_reader.locate_key(key)
     }
 }

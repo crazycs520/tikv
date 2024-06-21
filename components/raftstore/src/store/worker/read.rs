@@ -296,7 +296,7 @@ where
         let end = Unbounded::<Vec<u8>>;
         for (key, id) in meta.region_ranges.range((start, end)){
             if let Some(reader) =  meta.readers.get(id){
-                if util::check_key_in_region(key, &reader.region).is_ok(){
+                if reader.leader_lease.is_some() && util::check_key_in_region(key, &reader.region).is_ok(){
                     return Some(*id);
                 }
             }
