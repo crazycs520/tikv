@@ -238,7 +238,7 @@ where
     /// StoreMeta
     fn get_executor_and_len(&self, region_id: u64) -> (usize, Option<Self::Executor>);
 
-    fn locate_key(&self, key: &[u8]) -> Option<u64>;
+    fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)>;
 }
 
 #[derive(Clone)]
@@ -290,14 +290,14 @@ where
     }
 
     // locate_key returns region_id which contains the key.
-    fn locate_key(&self, key: &[u8]) -> Option<u64> {
+    fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         let meta = self.store_meta.as_ref().lock().unwrap();
         let start = Excluded(data_key(key));
         let end = Unbounded::<Vec<u8>>;
         for (key, id) in meta.region_ranges.range((start, end)){
             if let Some(reader) =  meta.readers.get(id){
                 if reader.leader_lease.is_some() && util::check_key_in_region(key, &reader.region).is_ok(){
-                    return Some(*id);
+                    return Some((reader.region.clone(), reader.peer_id, reader.term))
                 }
             }
             return None;
@@ -876,7 +876,7 @@ where
         self.snap_cache.as_mut().take();
     }
 
-    pub fn locate_key(&self, key: &[u8]) -> Option<u64> {
+    pub fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         self.store_meta.locate_key(key)
     }
 }

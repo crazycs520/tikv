@@ -494,7 +494,7 @@ where
         })
     }
 
-    fn locate_key(&self, key: &[u8]) -> Option<u64> {
+    fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         self.router.locate_key(key)
     }
     fn release_snapshot(&self) {

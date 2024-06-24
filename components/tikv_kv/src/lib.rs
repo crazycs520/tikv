@@ -38,11 +38,7 @@ use engine_traits::{
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::prelude::*;
 use into_other::IntoOther;
-use kvproto::{
-    errorpb::Error as ErrorHeader,
-    kvrpcpb::{Context, DiskFullOpt, ExtraOp as TxnExtraOp, KeyRange},
-    raft_cmdpb,
-};
+use kvproto::{errorpb::Error as ErrorHeader, kvrpcpb::{Context, DiskFullOpt, ExtraOp as TxnExtraOp, KeyRange}, metapb, raft_cmdpb};
 use pd_client::BucketMeta;
 use raftstore::store::{PessimisticLockPair, TxnExt};
 use thiserror::Error;
@@ -284,7 +280,7 @@ pub trait Engine: Send + Clone + 'static {
 
     fn async_snapshot(&self, ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> Result<()>;
 
-    fn locate_key(&self, _key: &[u8]) -> Option<u64> {
+    fn locate_key(&self, _key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         unimplemented!()
     }
 

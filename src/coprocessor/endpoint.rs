@@ -46,6 +46,7 @@ use tipb::{
     EncodeType, ExecType, SelectResponse,
 };
 use tokio::sync::Semaphore;
+use raftstore::store::util;
 use txn_types::{Key, Lock};
 
 use crate::{
@@ -412,6 +413,7 @@ impl<E: Engine> Endpoint<E> {
     ) -> Result<(
         MemoryTraceGuard<coppb::Response>,
         Option<(Vec<FieldType>, TableScan)>,
+        ReqContext,
     )> {
         // When this function is being executed, it may be queued for a long time, so
         // that deadline may exceed.
@@ -474,7 +476,7 @@ impl<E: Engine> Endpoint<E> {
         resp.set_exec_details(exec_details);
         resp.set_exec_details_v2(exec_details_v2);
         resp.set_latest_buckets_version(buckets_version);
-        Ok((resp, index_lookup))
+        Ok((resp, index_lookup, tracker.req_ctx.clone()))
     }
 
     /// Handle a unary request and run on the read pool.
@@ -489,6 +491,7 @@ impl<E: Engine> Endpoint<E> {
         Output = Result<(
             MemoryTraceGuard<coppb::Response>,
             Option<(Vec<FieldType>, TableScan)>,
+            ReqContext,
         )>,
     > {
         let priority = req_ctx.context.get_priority();
@@ -535,7 +538,7 @@ impl<E: Engine> Endpoint<E> {
         let start_ts = TimeStamp::new(req.start_ts);
 
         let result_of_future = self
-            .parse_request_and_check_memory_locks(req, peer, false)
+            .parse_request_and_check_memory_locks(req, peer.clone(), false)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
 
         let this = self.clone();
@@ -548,14 +551,14 @@ impl<E: Engine> Endpoint<E> {
                 Err(e) => return make_error_response(e).into(),
                 Ok(handle_fut) => handle_fut,
             };
-            let (mut response, index_lookup) = match handle_fut.await {
+            let (mut response, index_lookup, req_ctx) = match handle_fut.await {
                 Err(e) => return make_error_response(e).into(),
                 Ok(response) => response,
             };
 
             if let Some((schema, table_info)) = index_lookup {
                 match this
-                    .handle_index_lookup(response.consume(), schema, table_info, start_ts)
+                    .handle_index_lookup(req_ctx,peer, response.consume(), schema, table_info, start_ts)
                     .await
                 {
                     Err(e) => return make_error_response(e).into(),
@@ -573,14 +576,31 @@ impl<E: Engine> Endpoint<E> {
 
     fn handle_index_lookup(
         &self,
+        req_ctx: ReqContext,
+        peer: Option<String>,
         mut resp: coppb::Response,
         schema: Vec<FieldType>,
         mut table_scan: TableScan,
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<coppb::Response>> {
+        let req_ctx = ReqContext::new(
+            ReqTag::select,
+            req_ctx.context, // need update
+            req_ctx.ranges, // need update
+            self.max_handle_duration,
+            peer,
+            Some(false),
+            start_ts.into(),
+            None,
+            self.perf_level,
+        );
+        let check_lock = self.check_memory_locks(&req_ctx);
+
         self.read_pool
             .spawn_handle(
                 async move {
+                    check_lock?;
+
                     let mut sel = SelectResponse::default();
                     sel.merge_from_bytes(resp.get_data())
                         .expect("fail to recover SelectResponse");
@@ -672,14 +692,24 @@ impl<E: Engine> Endpoint<E> {
                                         .unwrap();
                                 }
                                 let key = Key::from_raw(&key);
-                                if let Some(region_id) = unsafe {
+                                if let Some((region, peer_id, term)) = unsafe {
                                     with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
                                 } {
-                                    info!("index lookup locate key exist"; "key" => ?key.as_encoded(), "region" => region_id);
+                                    let ok = util::check_key_in_region(key.as_encoded(), &region).is_ok();
+                                    info!("index lookup locate key exist"; "key" => ?key.as_encoded(),
+                                        "region" => region.id,
+                                        "peer" => peer_id,
+                                        "term" => term,
+                                        "region_contain_key" => ok);
                                 } else {
                                     info!("index lookup locate key not exist"; "key" => ?key.as_encoded());
                                 }
                             }
+
+
+                            let snapshot =
+                                unsafe { with_tls_engine(|engine| Self::async_snapshot(engine, &req_ctx)) }
+                                    .await?;
 
                             let snapshot = unsafe {
                                 with_tls_engine(|e: &E| e.snapshot_on_kv_engine(&[], &[])).unwrap()
