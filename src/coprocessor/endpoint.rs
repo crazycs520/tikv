@@ -743,6 +743,10 @@ impl<E: Engine> Endpoint<E> {
                                         r.set_start(key.as_encoded().clone());
                                         r.set_end(key.as_encoded().clone());
                                         ranges.push(r);
+                                        info!("index lookup locate key"; "key" => ?key,
+                                            "region" => region.id,
+                                            "peer" => peer_id,
+                                            "term" => term);
                                         continue;
                                     }
                                     Self::build_extra_executor_fn(
@@ -758,6 +762,7 @@ impl<E: Engine> Endpoint<E> {
                                         batch_row_limit,
                                         quota_limiter.clone(),
                                     );
+                                    ranges.clear();
                                 }
 
                                 if let Some((region, peer_id, term)) = unsafe {
@@ -768,6 +773,10 @@ impl<E: Engine> Endpoint<E> {
                                     r.set_start(key.as_encoded().clone());
                                     r.set_end(key.as_encoded().clone());
                                     ranges.push(r);
+                                    info!("index lookup locate key"; "key" => ?key,
+                                            "region" => region.id,
+                                            "peer" => peer_id,
+                                            "term" => term);
                                 } else {
                                     info!("index lookup not locate key"; "key" => ?key);
                                     keep_indexes.push(i);
