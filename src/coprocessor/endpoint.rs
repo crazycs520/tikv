@@ -761,7 +761,7 @@ impl<E: Engine> Endpoint<E> {
                                         perf_level,
                                         batch_row_limit,
                                         quota_limiter.clone(),
-                                    );
+                                    ).await;
                                     ranges.clear();
                                 }
 
@@ -784,7 +784,7 @@ impl<E: Engine> Endpoint<E> {
                             }
                             if let Some((region, peer_id, term)) = &last_region {
                                 if ranges.len() > 0 {
-                                    Self::build_extra_executor_fn(
+                                    if let Err(e) = Self::build_extra_executor_fn(
                                         req.clone(),
                                         ranges.clone(),
                                         peer.clone(),
@@ -796,7 +796,9 @@ impl<E: Engine> Endpoint<E> {
                                         perf_level,
                                         batch_row_limit,
                                         quota_limiter.clone(),
-                                    );
+                                    ).await{
+                                        info!("index lookup build extra executor failed"; "e" => ?e);
+                                    }
                                 }
                             }
 
@@ -1125,10 +1127,10 @@ impl<E: Engine> Endpoint<E> {
             perf_level,
         );
         info!("index lookup build extra executor";
-"ranges" => ?req_ctx.ranges,
-"region" => region.id,
-"peer" => peer_id,
-"term" => term);
+            "ranges" => ?req_ctx.ranges,
+            "region" => region.id,
+            "peer" => peer_id,
+            "term" => term);
         let snap =
             unsafe { with_tls_engine(|engine| Self::async_snapshot(engine, &req_ctx)) }.await?;
         let data_version = snap.ext().get_data_version();
@@ -1144,7 +1146,7 @@ impl<E: Engine> Endpoint<E> {
         let mut input = CodedInputStream::from_bytes(req.get_data().clone());
         let mut dag = DagRequest::default();
         box_try!(dag.merge_from(&mut input));
-        let mut handler = dag::DagHandlerBuilder::new(
+        let handler = dag::DagHandlerBuilder::new(
             dag,
             req_ctx.ranges.clone(),
             store,
