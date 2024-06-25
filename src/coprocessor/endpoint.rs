@@ -745,81 +745,19 @@ impl<E: Engine> Endpoint<E> {
                                         ranges.push(r);
                                         continue;
                                     }
-                                    // build extra executor and exec.
-                                    let mut context = req.get_context().clone();
-                                    context.set_region_id(region.id);
-                                    context.set_region_epoch(region.region_epoch.clone().unwrap());
-                                    context.set_term(*term);
-                                    context.set_replica_read(false);
-                                    context.set_stale_read(false);
-                                    for p in &region.peers {
-                                        if p.id == *peer_id {
-                                            context.set_peer(p.clone());
-                                            break;
-                                        }
-                                    }
-
-                                    let req_ctx = ReqContext::new(
-                                        ReqTag::select,
-                                        context,
+                                    Self::build_extra_executor_fn(
+                                        req.clone(),
                                         ranges.clone(),
-                                        max_handle_duration,
                                         peer.clone(),
-                                        Some(false),
-                                        start_ts.into(),
-                                        None,
+                                        region,
+                                        *peer_id,
+                                        *term,
+                                        start_ts,
+                                        max_handle_duration,
                                         perf_level,
-                                    );
-                                    info!("index lookup build extra executor";
-                                    "ranges" => ?ranges,
-                                            "region" => region.id,
-                                            "peer" => peer_id,
-                                            "term" => term);
-                                    ranges.clear();
-                                    let snap = unsafe {
-                                        with_tls_engine(|engine| {
-                                            Self::async_snapshot(engine, &req_ctx)
-                                        })
-                                    }
-                                    .await?;
-                                    let data_version = snap.ext().get_data_version();
-                                    let store = SnapshotStore::new(
-                                        snap,
-                                        start_ts.into(),
-                                        req_ctx.context.get_isolation_level(),
-                                        !req_ctx.context.get_not_fill_cache(),
-                                        req_ctx.bypass_locks.clone(),
-                                        req_ctx.access_locks.clone(),
-                                        req.get_is_cache_enabled(),
-                                    );
-                                    let mut input =
-                                        CodedInputStream::from_bytes(req.get_data().clone());
-                                    let mut dag = DagRequest::default();
-                                    box_try!(dag.merge_from(&mut input));
-                                    let mut handler = dag::DagHandlerBuilder::new(
-                                        dag,
-                                        req_ctx.ranges.clone(),
-                                        store,
-                                        req_ctx.deadline,
                                         batch_row_limit,
-                                        false,
-                                        req.get_is_cache_enabled(),
-                                        None,
                                         quota_limiter.clone(),
-                                    )
-                                    .data_version(data_version)
-                                    .build();
-                                    if let Ok(mut handler) = handler{
-                                        let handle_request_future = check_deadline(handler.handle_request(), req_ctx.deadline);
-                                        // let extra_resp = handle_request_future.await;
-                                        // let mut extra_resp = match extra_resp{
-                                        //     Ok(resp) => resp,
-                                        //     Err(e) => panic!(e),
-                                        // };
-                                        info!("index lookup build handler succ"; "region_id" => req_ctx.context.region_id);
-                                    }else{
-                                        info!("index lookup build handler failed"; "region_id" => req_ctx.context.region_id, "error" => ?handler.err());
-                                    }
+                                    );
                                 }
 
                                 if let Some((region, peer_id, term)) = unsafe {
@@ -833,6 +771,23 @@ impl<E: Engine> Endpoint<E> {
                                 } else {
                                     info!("index lookup not locate key"; "key" => ?key);
                                     keep_indexes.push(i);
+                                }
+                            }
+                            if let Some((region, peer_id, term)) = &last_region {
+                                if ranges.len() > 0 {
+                                    Self::build_extra_executor_fn(
+                                        req.clone(),
+                                        ranges.clone(),
+                                        peer.clone(),
+                                        region,
+                                        *peer_id,
+                                        *term,
+                                        start_ts,
+                                        max_handle_duration,
+                                        perf_level,
+                                        batch_row_limit,
+                                        quota_limiter.clone(),
+                                    );
                                 }
                             }
 
@@ -1120,6 +1075,91 @@ impl<E: Engine> Endpoint<E> {
             .try_flatten() // Stream<Resp, Error>
             .or_else(|e| futures::future::ok(make_error_response(e))) // Stream<Resp, ()>
             .map(|item: std::result::Result<_, ()>| item.unwrap())
+    }
+
+    async fn build_extra_executor_fn(
+        req: coppb::Request,
+        ranges: Vec<coppb::KeyRange>,
+        peer: Option<String>,
+        region: &Arc<metapb::Region>,
+        peer_id: u64,
+        term: u64,
+        start_ts: TimeStamp,
+        max_handle_duration: Duration,
+        perf_level: PerfLevel,
+        batch_row_limit: usize,
+        quota_limiter: Arc<QuotaLimiter>,
+    ) -> Result<()> {
+        // build extra executor and exec.
+        let mut context = req.get_context().clone();
+        context.set_region_id(region.id);
+        context.set_region_epoch(region.region_epoch.clone().unwrap());
+        context.set_term(term);
+        context.set_replica_read(false);
+        context.set_stale_read(false);
+        for p in &region.peers {
+            if p.id == peer_id {
+                context.set_peer(p.clone());
+                break;
+            }
+        }
+
+        let req_ctx = ReqContext::new(
+            ReqTag::select,
+            context,
+            ranges,
+            max_handle_duration,
+            peer.clone(),
+            Some(false),
+            start_ts.into(),
+            None,
+            perf_level,
+        );
+        info!("index lookup build extra executor";
+"ranges" => ?req_ctx.ranges,
+"region" => region.id,
+"peer" => peer_id,
+"term" => term);
+        let snap =
+            unsafe { with_tls_engine(|engine| Self::async_snapshot(engine, &req_ctx)) }.await?;
+        let data_version = snap.ext().get_data_version();
+        let store = SnapshotStore::new(
+            snap,
+            start_ts.into(),
+            req_ctx.context.get_isolation_level(),
+            !req_ctx.context.get_not_fill_cache(),
+            req_ctx.bypass_locks.clone(),
+            req_ctx.access_locks.clone(),
+            req.get_is_cache_enabled(),
+        );
+        let mut input = CodedInputStream::from_bytes(req.get_data().clone());
+        let mut dag = DagRequest::default();
+        box_try!(dag.merge_from(&mut input));
+        let mut handler = dag::DagHandlerBuilder::new(
+            dag,
+            req_ctx.ranges.clone(),
+            store,
+            req_ctx.deadline,
+            batch_row_limit,
+            false,
+            req.get_is_cache_enabled(),
+            None,
+            quota_limiter.clone(),
+        )
+        .data_version(data_version)
+        .build();
+        if let Ok(mut handler) = handler {
+            let handle_request_future = check_deadline(handler.handle_request(), req_ctx.deadline);
+            // let extra_resp = handle_request_future.await;
+            // let mut extra_resp = match extra_resp{
+            //     Ok(resp) => resp,
+            //     Err(e) => panic!(e),
+            // };
+            info!("index lookup build handler succ"; "region_id" => req_ctx.context.region_id);
+        } else {
+            info!("index lookup build handler failed"; "region_id" => req_ctx.context.region_id, "error" => ?handler.err());
+        }
+        Ok(())
     }
 }
 
