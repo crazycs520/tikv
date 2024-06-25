@@ -25,7 +25,7 @@ use kvproto::{
 use protobuf::{CodedInputStream, Message};
 use raftstore::store::util;
 use resource_metering::{FutureExt, ResourceTagFactory, StreamExt};
-use tidb_query_common::execute_stats::ExecSummary;
+use tidb_query_common::{execute_stats::ExecSummary, util::convert_to_prefix_next};
 use tidb_query_datatype::{
     codec::{
         chunk::{ChunkColumnEncoder, Column},
@@ -741,7 +741,8 @@ impl<E: Engine> Endpoint<E> {
                                     {
                                         let mut r = coppb::KeyRange::new();
                                         r.set_start(key.as_encoded().clone());
-                                        r.set_end(key.as_encoded().clone());
+                                        r.set_end(r.get_start().to_vec());
+                                        convert_to_prefix_next(r.mut_end());
                                         ranges.push(r);
                                         info!("index lookup locate key"; "key" => ?key,
                                             "region" => region.id,
@@ -771,7 +772,8 @@ impl<E: Engine> Endpoint<E> {
                                     last_region = Some((region.clone(), peer_id, term));
                                     let mut r = coppb::KeyRange::new();
                                     r.set_start(key.as_encoded().clone());
-                                    r.set_end(key.as_encoded().clone());
+                                    r.set_end(r.get_start().to_vec());
+                                    convert_to_prefix_next(r.mut_end());
                                     ranges.push(r);
                                     info!("index lookup locate key"; "key" => ?key,
                                             "region" => region.id,
