@@ -2,12 +2,12 @@
 
 use std::{
     borrow::Cow,
+    cmp::{min, Ordering},
     future::Future,
     marker::PhantomData,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use std::cmp::{min, Ordering};
 
 use ::tracker::{
     set_tls_tracker_token, with_tls_tracker, RequestInfo, RequestType, GLOBAL_TRACKERS,
@@ -20,8 +20,10 @@ use futures::{channel::mpsc, prelude::*};
 use kvproto::{
     coprocessor as coppb, errorpb,
     kvrpcpb::{self, CommandPri},
+    metapb,
 };
 use protobuf::{CodedInputStream, Message};
+use raftstore::store::util;
 use resource_metering::{FutureExt, ResourceTagFactory, StreamExt};
 use tidb_query_common::execute_stats::ExecSummary;
 use tidb_query_datatype::{
@@ -46,7 +48,6 @@ use tipb::{
     EncodeType, ExecType, SelectResponse,
 };
 use tokio::sync::Semaphore;
-use raftstore::store::util;
 use txn_types::{Key, Lock};
 
 use crate::{
@@ -441,6 +442,11 @@ impl<E: Engine> Endpoint<E> {
         };
 
         let index_lookup = handler.index_lookup();
+        if let Some(req) = handler.get_req() {
+            if req.has_extra_table_info() {
+                // build extra exec
+            }
+        }
 
         tracker.on_begin_all_items();
 
@@ -536,6 +542,7 @@ impl<E: Engine> Endpoint<E> {
         set_tls_tracker_token(tracker);
 
         let start_ts = TimeStamp::new(req.start_ts);
+        let extra_req = req.clone();
 
         let result_of_future = self
             .parse_request_and_check_memory_locks(req, peer.clone(), false)
@@ -558,7 +565,14 @@ impl<E: Engine> Endpoint<E> {
 
             if let Some((schema, table_info)) = index_lookup {
                 match this
-                    .handle_index_lookup(req_ctx,peer, response.consume(), schema, table_info, start_ts)
+                    .handle_index_lookup(
+                        extra_req,
+                        peer,
+                        response.consume(),
+                        schema,
+                        table_info,
+                        start_ts,
+                    )
                     .await
                 {
                     Err(e) => return make_error_response(e).into(),
@@ -576,30 +590,34 @@ impl<E: Engine> Endpoint<E> {
 
     fn handle_index_lookup(
         &self,
-        req_ctx: ReqContext,
+        req: coppb::Request,
         peer: Option<String>,
         mut resp: coppb::Response,
         schema: Vec<FieldType>,
         mut table_scan: TableScan,
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<coppb::Response>> {
-        let req_ctx = ReqContext::new(
-            ReqTag::select,
-            req_ctx.context, // need update
-            req_ctx.ranges, // need update
-            self.max_handle_duration,
-            peer,
-            Some(false),
-            start_ts.into(),
-            None,
-            self.perf_level,
-        );
-        let check_lock = self.check_memory_locks(&req_ctx);
+        // let req_ctx = ReqContext::new(
+        //     ReqTag::select,
+        //     req_ctx.context, // need update
+        //     req_ctx.ranges,  // need update
+        //     self.max_handle_duration,
+        //     peer,
+        //     Some(false),
+        //     start_ts.into(),
+        //     None,
+        //     self.perf_level,
+        // );
+        // let check_lock = self.check_memory_locks(&req_ctx);
+        let max_handle_duration = self.max_handle_duration;
+        let perf_level = self.perf_level;
+        let batch_row_limit = self.get_batch_row_limit(false);
+        let quota_limiter = self.quota_limiter.clone();
 
         self.read_pool
             .spawn_handle(
                 async move {
-                    check_lock?;
+                    // check_lock?;
 
                     let mut sel = SelectResponse::default();
                     sel.merge_from_bytes(resp.get_data())
@@ -659,18 +677,19 @@ impl<E: Engine> Endpoint<E> {
                         table_prefix.extend(RECORD_PREFIX_SEP);
 
                         if !all_data.is_empty() {
-                            all_data.sort_by(|a,b|{
+                            all_data.sort_by(|a, b| {
                                 let mut ctx = EvalContext::default();
                                 let l = min(a.len(), b.len());
                                 for i in 0..l {
-                                    if let Ok(ordering) = a[i].cmp(&mut ctx, &b[i]){
-                                        if ordering != Ordering::Equal{
+                                    if let Ok(ordering) = a[i].cmp(&mut ctx, &b[i]) {
+                                        if ordering != Ordering::Equal {
                                             return ordering;
                                         }
                                     }
                                 }
                                 return a.len().cmp(&b.len());
                             });
+                            let mut keys = Vec::with_capacity(all_data.len());
                             for row in &all_data {
                                 let mut key;
                                 if schema_types.len() == 1
@@ -692,24 +711,130 @@ impl<E: Engine> Endpoint<E> {
                                         .unwrap();
                                 }
                                 let key = Key::from_raw(&key);
+                                keys.push(key);
+                                // if let Some((region, peer_id, term)) = unsafe
+                                // {
+                                //     with_tls_engine(|e: &E|
+                                // e.locate_key(key.as_encoded()))
+                                // } {
+                                //     let ok =
+                                // util::check_key_in_region(key.as_encoded(),
+                                // &region).is_ok();
+                                //     info!("index lookup locate key exist";
+                                // "key" => ?key.as_encoded(),
+                                //         "region" => region.id,
+                                //         "peer" => peer_id,
+                                //         "term" => term,
+                                //         "region_contain_key" => ok);
+                                // } else {
+                                //     info!("index lookup locate key not
+                                // exist"; "key" => ?key.as_encoded());
+                                // }
+                            }
+                            keys.sort();
+                            let mut ranges: Vec<coppb::KeyRange> = Vec::new();
+                            let mut keep_indexes = Vec::new();
+                            let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
+                            for (i, key) in keys.into_iter().enumerate() {
+                                if let Some((region, peer_id, term)) = &last_region {
+                                    if util::check_key_in_region(key.as_encoded(), &region).is_ok()
+                                    {
+                                        let mut r = coppb::KeyRange::new();
+                                        r.set_start(key.as_encoded().clone());
+                                        r.set_end(key.as_encoded().clone());
+                                        ranges.push(r);
+                                        continue;
+                                    }
+                                    // build extra executor and exec.
+                                    let mut context = req.get_context().clone();
+                                    context.set_region_id(region.id);
+                                    context.set_region_epoch(region.region_epoch.clone().unwrap());
+                                    context.set_term(*term);
+                                    context.set_replica_read(false);
+                                    context.set_stale_read(false);
+                                    for p in &region.peers {
+                                        if p.id == *peer_id {
+                                            context.set_peer(p.clone());
+                                            break;
+                                        }
+                                    }
+
+                                    let req_ctx = ReqContext::new(
+                                        ReqTag::select,
+                                        context,
+                                        ranges.clone(),
+                                        max_handle_duration,
+                                        peer.clone(),
+                                        Some(false),
+                                        start_ts.into(),
+                                        None,
+                                        perf_level,
+                                    );
+                                    info!("index lookup build extra executor";
+                                    "ranges" => ?ranges,
+                                            "region" => region.id,
+                                            "peer" => peer_id,
+                                            "term" => term);
+                                    ranges.clear();
+                                    let snap = unsafe {
+                                        with_tls_engine(|engine| {
+                                            Self::async_snapshot(engine, &req_ctx)
+                                        })
+                                    }
+                                    .await?;
+                                    let data_version = snap.ext().get_data_version();
+                                    let store = SnapshotStore::new(
+                                        snap,
+                                        start_ts.into(),
+                                        req_ctx.context.get_isolation_level(),
+                                        !req_ctx.context.get_not_fill_cache(),
+                                        req_ctx.bypass_locks.clone(),
+                                        req_ctx.access_locks.clone(),
+                                        req.get_is_cache_enabled(),
+                                    );
+                                    let mut input =
+                                        CodedInputStream::from_bytes(req.get_data().clone());
+                                    let mut dag = DagRequest::default();
+                                    box_try!(dag.merge_from(&mut input));
+                                    let mut handler = dag::DagHandlerBuilder::new(
+                                        dag,
+                                        req_ctx.ranges.clone(),
+                                        store,
+                                        req_ctx.deadline,
+                                        batch_row_limit,
+                                        false,
+                                        req.get_is_cache_enabled(),
+                                        None,
+                                        quota_limiter.clone(),
+                                    )
+                                    .data_version(data_version)
+                                    .build();
+                                    if let Ok(mut handler) = handler{
+                                        let handle_request_future = check_deadline(handler.handle_request(), req_ctx.deadline);
+                                        // let extra_resp = handle_request_future.await;
+                                        // let mut extra_resp = match extra_resp{
+                                        //     Ok(resp) => resp,
+                                        //     Err(e) => panic!(e),
+                                        // };
+                                        info!("index lookup build handler succ"; "region_id" => req_ctx.context.region_id);
+                                    }else{
+                                        info!("index lookup build handler failed"; "region_id" => req_ctx.context.region_id, "error" => ?handler.err());
+                                    }
+                                }
+
                                 if let Some((region, peer_id, term)) = unsafe {
                                     with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
                                 } {
-                                    let ok = util::check_key_in_region(key.as_encoded(), &region).is_ok();
-                                    info!("index lookup locate key exist"; "key" => ?key.as_encoded(),
-                                        "region" => region.id,
-                                        "peer" => peer_id,
-                                        "term" => term,
-                                        "region_contain_key" => ok);
+                                    last_region = Some((region.clone(), peer_id, term));
+                                    let mut r = coppb::KeyRange::new();
+                                    r.set_start(key.as_encoded().clone());
+                                    r.set_end(key.as_encoded().clone());
+                                    ranges.push(r);
                                 } else {
-                                    info!("index lookup locate key not exist"; "key" => ?key.as_encoded());
+                                    info!("index lookup not locate key"; "key" => ?key);
+                                    keep_indexes.push(i);
                                 }
                             }
-
-
-                            let snapshot =
-                                unsafe { with_tls_engine(|engine| Self::async_snapshot(engine, &req_ctx)) }
-                                    .await?;
 
                             let snapshot = unsafe {
                                 with_tls_engine(|e: &E| e.snapshot_on_kv_engine(&[], &[])).unwrap()

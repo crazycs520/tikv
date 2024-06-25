@@ -38,7 +38,11 @@ use engine_traits::{
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use futures::prelude::*;
 use into_other::IntoOther;
-use kvproto::{errorpb::Error as ErrorHeader, kvrpcpb::{Context, DiskFullOpt, ExtraOp as TxnExtraOp, KeyRange}, metapb, raft_cmdpb};
+use kvproto::{
+    errorpb::Error as ErrorHeader,
+    kvrpcpb::{Context, DiskFullOpt, ExtraOp as TxnExtraOp, KeyRange},
+    metapb, raft_cmdpb,
+};
 use pd_client::BucketMeta;
 use raftstore::store::{PessimisticLockPair, TxnExt};
 use thiserror::Error;

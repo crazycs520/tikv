@@ -1,8 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::cell::RefCell;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use crossbeam::channel::TrySendError;
 use engine_traits::{KvEngine, RaftEngine, Snapshot};
@@ -124,7 +123,7 @@ where
 
     fn release_snapshot_cache(&self);
 
-    fn locate_key(&self, _key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)>{
+    fn locate_key(&self, _key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         unimplemented!()
     }
 }

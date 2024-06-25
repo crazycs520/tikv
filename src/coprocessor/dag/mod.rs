@@ -85,6 +85,7 @@ pub struct BatchDagHandler {
     runner: tidb_query_executors::runner::BatchExecutorsRunner<Statistics>,
     data_version: Option<u64>,
     index_lookup: Option<TableScan>,
+    req: Option<DagRequest>,
 }
 
 impl BatchDagHandler {
@@ -100,6 +101,7 @@ impl BatchDagHandler {
         paging_size: Option<u64>,
         quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
+        let extra_dag = req.has_extra_table_info().then(|| req.clone());
         let index_lookup = req
             .has_extra_table_info()
             .then(|| req.take_extra_table_info());
@@ -114,10 +116,22 @@ impl BatchDagHandler {
                 paging_size,
                 quota_limiter,
             )?,
+            req: extra_dag,
             data_version,
             index_lookup,
         })
     }
+
+    // fn build_extra_dag_handler<S: Store + 'static>(
+    //     &self,
+    //     ranges: Vec<KeyRange>,
+    //     store: S,
+    //     data_version: Option<u64>,
+    //     deadline: Deadline,
+    //     quota_limiter: Arc<QuotaLimiter>,
+    // ) -> Result<Self> {
+    //     unimplemented!()
+    // }
 }
 
 #[async_trait]
@@ -143,6 +157,10 @@ impl RequestHandler for BatchDagHandler {
         self.index_lookup
             .as_ref()
             .map(|index_lookup| (self.runner.schema().to_vec(), index_lookup.clone()))
+    }
+
+    fn get_req(&self) -> Option<DagRequest> {
+        self.req.clone()
     }
 }
 

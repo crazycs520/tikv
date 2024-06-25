@@ -3,6 +3,7 @@
 // #[PerformanceCriticalPath]
 use std::{
     cell::Cell,
+    collections::Bound::{Excluded, Unbounded},
     fmt::{self, Display, Formatter},
     ops::Deref,
     sync::{
@@ -10,11 +11,11 @@ use std::{
         Arc, Mutex,
     },
 };
-use std::collections::Bound::{Excluded, Unbounded};
 
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
 use engine_traits::{KvEngine, RaftEngine, Snapshot};
 use fail::fail_point;
+use keys::data_key;
 use kvproto::{
     errorpb,
     kvrpcpb::ExtraOp as TxnExtraOp,
@@ -29,7 +30,6 @@ use tikv_util::{
     time::{monotonic_raw_now, ThreadReadId},
 };
 use time::Timespec;
-use keys::data_key;
 
 use super::metrics::*;
 use crate::{
@@ -294,10 +294,12 @@ where
         let meta = self.store_meta.as_ref().lock().unwrap();
         let start = Excluded(data_key(key));
         let end = Unbounded::<Vec<u8>>;
-        for (key, id) in meta.region_ranges.range((start, end)){
-            if let Some(reader) =  meta.readers.get(id){
-                if reader.leader_lease.is_some() && util::check_key_in_region(key, &reader.region).is_ok(){
-                    return Some((reader.region.clone(), reader.peer_id, reader.term))
+        for (key, id) in meta.region_ranges.range((start, end)) {
+            if let Some(reader) = meta.readers.get(id) {
+                if reader.leader_lease.is_some()
+                    && util::check_key_in_region(key, &reader.region).is_ok()
+                {
+                    return Some((reader.region.clone(), reader.peer_id, reader.term));
                 }
             }
             return None;

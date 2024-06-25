@@ -44,7 +44,7 @@ use rand::prelude::*;
 use tidb_query_common::execute_stats::ExecSummary;
 use tikv_alloc::{mem_trace, Id, MemoryTrace, MemoryTraceGuard};
 use tikv_util::{deadline::Deadline, time::Duration};
-use tipb::{FieldType, TableScan};
+use tipb::{DagRequest, FieldType, TableScan};
 use txn_types::TsSet;
 
 pub use self::{
@@ -92,6 +92,10 @@ pub trait RequestHandler: Send {
     }
 
     fn index_lookup(&self) -> Option<(Vec<FieldType>, TableScan)> {
+        None
+    }
+
+    fn get_req(&self) -> Option<DagRequest> {
         None
     }
 }
