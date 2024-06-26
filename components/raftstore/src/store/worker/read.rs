@@ -30,6 +30,7 @@ use tikv_util::{
     time::{monotonic_raw_now, ThreadReadId},
 };
 use time::Timespec;
+use txn_types::Key;
 
 use super::metrics::*;
 use crate::{
@@ -301,10 +302,13 @@ where
                 {
                     return Some((reader.region.clone(), reader.peer_id, reader.term));
                 } else {
+                    let k = Key::from_raw(key);
+                    let start = Key::from_raw(reader.region.start_key.as_slice());
+                    let end = Key::from_raw(reader.region.end_key.as_slice());
                     info!("locate key exist, but not valid";
-                        "key" => ?key,
-                        "region_start_key" => ?reader.region.start_key,
-                        "region_end_key" => ?reader.region.end_key,
+                        "key" => ?k,
+                        "region_start_key" => ?start,
+                        "region_end_key" => ?end,
                         "lease" => reader.leader_lease.is_some(),
                         "contain" => util::check_key_in_region(key, &reader.region).is_ok(),
                         "region_id" => reader.region.id,
