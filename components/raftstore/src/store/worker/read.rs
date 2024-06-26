@@ -300,6 +300,13 @@ where
                 if reader.leader_lease.is_some()
                     && util::check_key_in_region(key, &reader.region).is_ok()
                 {
+                    info!("locate key exist and valid";
+                        "key" => ?key,
+                        "end_key" => ?_end_key,
+                        "region_start_key" => ?reader.region.start_key,
+                        "region_end_key" => ?reader.region.end_key,
+                        "region_id" => reader.region.id,
+                        "term" => reader.term);
                     return Some((reader.region.clone(), reader.peer_id, reader.term));
                 } else {
                     info!("locate key exist, but not valid";

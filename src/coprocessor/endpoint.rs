@@ -760,6 +760,8 @@ impl<E: Engine> Endpoint<E> {
                                     ranges.push(r);
                                     info!("index lookup locate key"; "key" => ?key,
                                             "region" => region.id,
+                                            "region_start_key" => ?region.start_key,
+                                            "region_end_key" => ?region.end_key,
                                             "peer" => peer_id,
                                             "term" => term);
                                 } else {
