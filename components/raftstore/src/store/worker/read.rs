@@ -25,7 +25,7 @@ use kvproto::{
 use pd_client::BucketMeta;
 use tikv_util::{
     codec::number::decode_u64,
-    debug, error,
+    debug, error, info,
     lru::LruCache,
     time::{monotonic_raw_now, ThreadReadId},
 };
@@ -300,7 +300,11 @@ where
                     && util::check_key_in_region(key, &reader.region).is_ok()
                 {
                     return Some((reader.region.clone(), reader.peer_id, reader.term));
+                } else {
+                    info!("locate key exist, but not valid"; "key" => ?key, "lease" => reader.leader_lease.is_some(), "contain" => util::check_key_in_region(key, &reader.region).is_ok(), "region_id" => reader.region.id, "term" => reader.term);
                 }
+            } else {
+                info!("locate key not exist"; "key" => ?key);
             }
             return None;
         }
