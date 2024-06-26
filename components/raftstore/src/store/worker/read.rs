@@ -301,7 +301,14 @@ where
                 {
                     return Some((reader.region.clone(), reader.peer_id, reader.term));
                 } else {
-                    info!("locate key exist, but not valid"; "key" => ?key, "lease" => reader.leader_lease.is_some(), "contain" => util::check_key_in_region(key, &reader.region).is_ok(), "region_id" => reader.region.id, "term" => reader.term);
+                    info!("locate key exist, but not valid";
+                        "key" => ?key,
+                        "region_start_key" => ?reader.region.start_key,
+                        "region_end_key" => ?reader.region.end_key,
+                        "lease" => reader.leader_lease.is_some(),
+                        "contain" => util::check_key_in_region(key, &reader.region).is_ok(),
+                        "region_id" => reader.region.id,
+                        "term" => reader.term);
                 }
             } else {
                 info!("locate key not exist"; "key" => ?key);
