@@ -1148,6 +1148,8 @@ impl<E: Engine> Endpoint<E> {
         let mut input = CodedInputStream::from_bytes(req.get_data().clone());
         let mut dag = DagRequest::default();
         box_try!(dag.merge_from(&mut input));
+        let extra_executor = dag.take_extra_executors();
+        dag.set_executors(extra_executor);
         let handler = dag::DagHandlerBuilder::new(
             dag,
             req_ctx.ranges.clone(),
