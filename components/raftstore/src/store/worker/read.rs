@@ -294,9 +294,8 @@ where
     fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         let meta = self.store_meta.as_ref().lock().unwrap();
         let start = Excluded(data_key(key));
-        let start2 = start.clone();
         let end = Unbounded::<Vec<u8>>;
-        for (key, id) in meta.region_ranges.range((start, end)) {
+        for (_end_key, id) in meta.region_ranges.range((start, end)) {
             if let Some(reader) = meta.readers.get(id) {
                 if reader.leader_lease.is_some()
                     && util::check_key_in_region(key, &reader.region).is_ok()
@@ -305,7 +304,7 @@ where
                 } else {
                     info!("locate key exist, but not valid";
                         "key" => ?key,
-                        "start" => ?start2,
+                        "end_key" => ?_end_key,
                         "region_start_key" => ?reader.region.start_key,
                         "region_end_key" => ?reader.region.end_key,
                         "lease" => reader.leader_lease.is_some(),
