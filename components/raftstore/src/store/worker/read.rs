@@ -302,13 +302,10 @@ where
                 {
                     return Some((reader.region.clone(), reader.peer_id, reader.term));
                 } else {
-                    let k = Key::from_encoded(key.to_vec());
-                    let start = Key::from_encoded(reader.region.start_key.clone());
-                    let end = Key::from_encoded(reader.region.end_key.clone());
                     info!("locate key exist, but not valid";
-                        "key" => ?k,
-                        "region_start_key" => ?start,
-                        "region_end_key" => ?end,
+                        "key" => ?key,
+                        "region_start_key" => ?reader.region.start_key,
+                        "region_end_key" => ?reader.region.end_key,
                         "lease" => reader.leader_lease.is_some(),
                         "contain" => util::check_key_in_region(key, &reader.region).is_ok(),
                         "region_id" => reader.region.id,
