@@ -717,16 +717,16 @@ impl<E: Engine> Endpoint<E> {
                             let mut keep_indexes = Vec::new();
                             let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
                             for (i, key) in keys.into_iter().enumerate() {
+                                let key = Key::from_raw(&key);
                                 if let Some((region, peer_id, term)) = &last_region {
-                                    if util::check_key_in_region(&key, &region).is_ok()
+                                    if util::check_key_in_region(key.as_encoded(), &region).is_ok()
                                     {
                                         let mut r = coppb::KeyRange::new();
-                                        let start_key = Key::from_raw(&key);
-                                        r.set_start(start_key.into_encoded());
+                                        r.set_start(key.as_encoded().to_vec());
                                         r.set_end(r.get_start().to_vec());
                                         convert_to_prefix_next(r.mut_end());
                                         ranges.push(r);
-                                        info!("index lookup locate key"; "key" => ?key,
+                                        info!("index lookup locate key"; "key" => ?key.as_encoded(),
                                             "region" => region.id,
                                             "peer" => peer_id,
                                             "term" => term);
@@ -749,16 +749,15 @@ impl<E: Engine> Endpoint<E> {
                                 }
 
                                 if let Some((region, peer_id, term)) = unsafe {
-                                    with_tls_engine(|e: &E| e.locate_key(&key))
+                                    with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
                                 } {
                                     last_region = Some((region.clone(), peer_id, term));
                                     let mut r = coppb::KeyRange::new();
-                                    let start_key = Key::from_raw(&key);
-                                    r.set_start(start_key.into_encoded());
+                                    r.set_start(key.as_encoded().to_vec());
                                     r.set_end(r.get_start().to_vec());
                                     convert_to_prefix_next(r.mut_end());
                                     ranges.push(r);
-                                    info!("index lookup locate key"; "key" => ?key,
+                                    info!("index lookup locate key"; "key" => ?key.as_encoded(),
                                             "region" => region.id,
                                             "region_start_key" => ?region.start_key,
                                             "region_end_key" => ?region.end_key,
