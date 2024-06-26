@@ -710,26 +710,7 @@ impl<E: Engine> Endpoint<E> {
                                     key.write_datum(&mut EvalContext::default(), row, true)
                                         .unwrap();
                                 }
-                                let key = Key::from_raw(&key);
                                 keys.push(key);
-                                // if let Some((region, peer_id, term)) = unsafe
-                                // {
-                                //     with_tls_engine(|e: &E|
-                                // e.locate_key(key.as_encoded()))
-                                // } {
-                                //     let ok =
-                                // util::check_key_in_region(key.as_encoded(),
-                                // &region).is_ok();
-                                //     info!("index lookup locate key exist";
-                                // "key" => ?key.as_encoded(),
-                                //         "region" => region.id,
-                                //         "peer" => peer_id,
-                                //         "term" => term,
-                                //         "region_contain_key" => ok);
-                                // } else {
-                                //     info!("index lookup locate key not
-                                // exist"; "key" => ?key.as_encoded());
-                                // }
                             }
                             keys.sort();
                             let mut ranges: Vec<coppb::KeyRange> = Vec::new();
@@ -737,10 +718,11 @@ impl<E: Engine> Endpoint<E> {
                             let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
                             for (i, key) in keys.into_iter().enumerate() {
                                 if let Some((region, peer_id, term)) = &last_region {
-                                    if util::check_key_in_region(key.as_encoded(), &region).is_ok()
+                                    if util::check_key_in_region(&key, &region).is_ok()
                                     {
                                         let mut r = coppb::KeyRange::new();
-                                        r.set_start(key.as_encoded().clone());
+                                        let start_key = Key::from_raw(&key);
+                                        r.set_start(start_key.into_encoded());
                                         r.set_end(r.get_start().to_vec());
                                         convert_to_prefix_next(r.mut_end());
                                         ranges.push(r);
@@ -767,11 +749,12 @@ impl<E: Engine> Endpoint<E> {
                                 }
 
                                 if let Some((region, peer_id, term)) = unsafe {
-                                    with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
+                                    with_tls_engine(|e: &E| e.locate_key(&key))
                                 } {
                                     last_region = Some((region.clone(), peer_id, term));
                                     let mut r = coppb::KeyRange::new();
-                                    r.set_start(key.as_encoded().clone());
+                                    let start_key = Key::from_raw(&key);
+                                    r.set_start(start_key.into_encoded());
                                     r.set_end(r.get_start().to_vec());
                                     convert_to_prefix_next(r.mut_end());
                                     ranges.push(r);
