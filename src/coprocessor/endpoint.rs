@@ -684,27 +684,27 @@ impl<E: Engine> Endpoint<E> {
                 let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
                 let mut ranges_groups = Vec::new();
                 fn add_point_range(
-                    key: &Key,
+                    key: Vec<u8>,
                     region: Arc<metapb::Region>,
                     peer_id: u64,
                     term: u64,
                     ranges: &mut Vec<coppb::KeyRange>,
                 ) {
-                    let mut r = coppb::KeyRange::new();
-                    r.set_start(key.as_encoded().to_vec());
-                    r.set_end(r.get_start().to_vec());
-                    convert_to_prefix_next(r.mut_end());
-                    ranges.push(r);
-                    info!("index lookup locate key"; "key" => ?key.as_encoded(),
+                    info!("index lookup locate key"; "key" => ?key,
                                                 "region" => region.id,
                                                 "peer" => peer_id,
                                                 "term" => term);
+                    let mut r = coppb::KeyRange::new();
+                    r.set_start(key);
+                    r.set_end(r.get_start().to_vec());
+                    convert_to_prefix_next(r.mut_end());
+                    ranges.push(r);
                 }
-                for (i, key) in keys.into_iter().enumerate() {
-                    let key = Key::from_raw(&key);
+                for (i, raw_key) in keys.into_iter().enumerate() {
+                    let key = Key::from_raw(&raw_key);
                     if let Some((region, peer_id, term)) = &last_region {
                         if util::check_key_in_region(key.as_encoded(), &region).is_ok() {
-                            add_point_range(&key, region.clone(), *peer_id, *term, &mut ranges);
+                            add_point_range(raw_key.clone(), region.clone(), *peer_id, *term, &mut ranges);
                             continue;
                         } else {
                             ranges_groups.push((ranges.clone(), region.clone(), *peer_id, *term));
@@ -716,7 +716,7 @@ impl<E: Engine> Endpoint<E> {
                         unsafe { with_tls_engine(|e: &E| e.locate_key(key.as_encoded())) }
                     {
                         last_region = Some((region.clone(), peer_id, term));
-                        add_point_range(&key, region, peer_id, term, &mut ranges);
+                        add_point_range(raw_key.clone(), region, peer_id, term, &mut ranges);
                     } else {
                         info!("index lookup not locate key"; "key" => ?key);
                         keep_indexes.push(i);
