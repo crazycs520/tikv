@@ -30,7 +30,6 @@ use tikv_util::{
     time::{monotonic_raw_now, ThreadReadId},
 };
 use time::Timespec;
-use txn_types::Key;
 
 use super::metrics::*;
 use crate::{

@@ -442,12 +442,6 @@ impl<E: Engine> Endpoint<E> {
         };
 
         let index_lookup = handler.index_lookup();
-        if let Some(req) = handler.get_req() {
-            if req.has_extra_table_info() {
-                // build extra exec
-            }
-        }
-
         tracker.on_begin_all_items();
 
         let deadline = tracker.req_ctx.deadline;
@@ -588,6 +582,303 @@ impl<E: Engine> Endpoint<E> {
         }
     }
 
+    fn build_extra_executor_range(
+        &self,
+        mut resp: coppb::Response,
+        schema: Vec<FieldType>,
+        mut table_scan: TableScan,
+    ) -> Option<(
+        Vec<(Vec<coppb::KeyRange>, Arc<metapb::Region>, u64, u64)>,
+        Vec<usize>,
+    )> {
+        // let check_lock = self.check_memory_locks(&req_ctx);
+        // build extra executor ranges.
+        let mut sel = SelectResponse::default();
+        if sel.merge_from_bytes(resp.get_data()).is_ok()
+            && sel.get_encode_type() == EncodeType::TypeChunk
+        {
+            let schema_types: Vec<_> = schema
+                .iter()
+                .map(|ft| {
+                    FieldTypeTp::from_u8(ft.get_tp() as u8).unwrap_or(FieldTypeTp::Unspecified)
+                })
+                .collect();
+            let mut all_data = Vec::new();
+            'outer: for chunk in sel.get_chunks() {
+                let mut data = chunk.get_rows_data();
+                if data.is_empty() {
+                    continue;
+                }
+                let mut columns = Vec::with_capacity(schema.len());
+                for ft in &schema {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let col = match Column::decode(
+                        &mut data,
+                        FieldTypeTp::from_u8(ft.get_tp() as u8).unwrap_or(FieldTypeTp::Unspecified),
+                    ) {
+                        Ok(col) => col,
+                        Err(e) => {
+                            info!("decode chunk error"; "err" => ?e);
+                            break 'outer;
+                        }
+                    };
+                    columns.push(col);
+                }
+                if columns.is_empty() {
+                    continue;
+                }
+                let len = columns[0].len();
+
+                for i in 0..len {
+                    let mut dt = Vec::new();
+                    for (j, ft) in schema.iter().enumerate() {
+                        dt.push(columns[j].get_datum(i, ft).expect("fail to get datum"));
+                    }
+                    all_data.push(dt);
+                }
+            }
+
+            let mut table_prefix = vec![];
+            table_prefix.extend(TABLE_PREFIX);
+            table_prefix.encode_i64(table_scan.get_table_id()).unwrap();
+            table_prefix.extend(RECORD_PREFIX_SEP);
+
+            if !all_data.is_empty() {
+                all_data.sort_by(|a, b| {
+                    let mut ctx = EvalContext::default();
+                    let l = min(a.len(), b.len());
+                    for i in 0..l {
+                        if let Ok(ordering) = a[i].cmp(&mut ctx, &b[i]) {
+                            if ordering != Ordering::Equal {
+                                return ordering;
+                            }
+                        }
+                    }
+                    return a.len().cmp(&b.len());
+                });
+                let mut keys = Vec::with_capacity(all_data.len());
+                for row in &all_data {
+                    let mut key;
+                    if schema_types.len() == 1
+                        && matches!(schema_types[0], FieldTypeTp::Long | FieldTypeTp::LongLong)
+                    {
+                        let idx = match row[0] {
+                            Datum::I64(x) => x,
+                            Datum::U64(x) => x as i64,
+                            _ => unreachable!(),
+                        };
+                        key = table_prefix.clone();
+                        key.encode_i64(idx).unwrap();
+                    } else {
+                        key = table_prefix.clone();
+                        key.write_datum(&mut EvalContext::default(), row, true)
+                            .unwrap();
+                    }
+                    keys.push(key);
+                }
+                keys.sort();
+                let mut ranges: Vec<coppb::KeyRange> = Vec::new();
+                let mut keep_indexes = Vec::new();
+                let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
+                let mut ranges_groups = Vec::new();
+                fn add_point_range(
+                    key: &Key,
+                    region: Arc<metapb::Region>,
+                    peer_id: u64,
+                    term: u64,
+                    ranges: &mut Vec<coppb::KeyRange>,
+                ) {
+                    let mut r = coppb::KeyRange::new();
+                    r.set_start(key.as_encoded().to_vec());
+                    r.set_end(r.get_start().to_vec());
+                    convert_to_prefix_next(r.mut_end());
+                    ranges.push(r);
+                    info!("index lookup locate key"; "key" => ?key.as_encoded(),
+                                                "region" => region.id,
+                                                "peer" => peer_id,
+                                                "term" => term);
+                }
+                for (i, key) in keys.into_iter().enumerate() {
+                    let key = Key::from_raw(&key);
+                    if let Some((region, peer_id, term)) = &last_region {
+                        if util::check_key_in_region(key.as_encoded(), &region).is_ok() {
+                            add_point_range(&key, region.clone(), *peer_id, *term, &mut ranges);
+                            continue;
+                        } else {
+                            ranges_groups.push((ranges.clone(), region.clone(), *peer_id, *term));
+                            ranges.clear();
+                        }
+                    }
+
+                    if let Some((region, peer_id, term)) =
+                        unsafe { with_tls_engine(|e: &E| e.locate_key(key.as_encoded())) }
+                    {
+                        last_region = Some((region.clone(), peer_id, term));
+                        add_point_range(&key, region, peer_id, term, &mut ranges);
+                    } else {
+                        info!("index lookup not locate key"; "key" => ?key);
+                        keep_indexes.push(i);
+                    }
+                }
+                if let Some((region, peer_id, term)) = &last_region {
+                    if ranges.len() > 0 {
+                        ranges_groups.push((ranges.clone(), region.clone(), *peer_id, *term));
+                    }
+                }
+                return Some((ranges_groups, keep_indexes));
+            }
+        }
+        return None;
+    }
+
+    #[inline]
+    fn handle_extra_requests(
+        &self,
+        req: coppb::Request,
+        peer: Option<String>,
+        resp: coppb::Response,
+        schema: Vec<FieldType>,
+        table_scan: TableScan,
+        start_ts: TimeStamp,
+    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+        let mut result_futures = Vec::new();
+        if let Some((ranges_groups, keep_indexes)) =
+            self.build_extra_executor_range(resp, schema, table_scan)
+        {
+            for range_group in ranges_groups {
+                let (ranges, region, peer_id, term) = range_group;
+                let range_result = self.handle_extra_request(
+                    req.clone(),
+                    ranges,
+                    peer.clone(),
+                    region,
+                    peer_id,
+                    term,
+                    start_ts,
+                );
+                result_futures.push(range_result);
+            }
+        }
+        async move {
+            let mut resps = Vec::new();
+            for result in result_futures {
+                let resp = result.await;
+                info!("get extra req resp"; "data" =>                 resp.data.len());
+                resps.push(resp);
+            }
+            MemoryTraceGuard::from(coppb::Response::new())
+        }
+    }
+
+    fn handle_extra_request(
+        &self,
+        req: coppb::Request,
+        ranges: Vec<coppb::KeyRange>,
+        peer: Option<String>,
+        region: Arc<metapb::Region>,
+        peer_id: u64,
+        term: u64,
+        start_ts: TimeStamp,
+    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+        let result_of_future = self
+            .parse_extra_requests(req, ranges, peer, region.clone(), peer_id, term, start_ts)
+            .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
+
+        async move {
+            let handle_fut = match result_of_future {
+                Err(e) => return make_error_response(e).into(),
+                Ok(handle_fut) => handle_fut,
+            };
+            let (mut response, _, req_ctx) = match handle_fut.await {
+                Err(e) => return make_error_response(e).into(),
+                Ok(response) => response,
+            };
+            info!("handle extra req finish"; "resp" => ?response);
+            response
+        }
+    }
+
+    fn parse_extra_requests(
+        &self,
+        req: coppb::Request,
+        ranges: Vec<coppb::KeyRange>,
+        peer: Option<String>,
+        region: Arc<metapb::Region>,
+        peer_id: u64,
+        term: u64,
+        start_ts: TimeStamp,
+    ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
+        // build extra executor and exec.
+        let mut context = req.get_context().clone();
+        context.set_region_id(region.id);
+        context.set_region_epoch(region.region_epoch.clone().unwrap());
+        context.set_term(term);
+        context.set_replica_read(false);
+        context.set_stale_read(false);
+        for p in &region.peers {
+            if p.id == peer_id {
+                context.set_peer(p.clone());
+                break;
+            }
+        }
+
+        let req_ctx = ReqContext::new(
+            ReqTag::select,
+            context,
+            ranges,
+            self.max_handle_duration,
+            peer.clone(),
+            Some(false),
+            start_ts.into(),
+            None,
+            self.perf_level,
+        );
+        info!("index lookup build extra executor";
+            "ranges" => ?req_ctx.ranges,
+            "region" => region.id,
+            "peer" => peer_id,
+            "term" => term);
+
+        self.check_memory_locks(&req_ctx)?;
+        let mut dag = DagRequest::default();
+        let data = req.get_data().clone();
+        let req_is_cache_enabled = req.get_is_cache_enabled();
+        let mut input = CodedInputStream::from_bytes(data);
+        box_try!(dag.merge_from(&mut input));
+        let extra_executor = dag.take_extra_executors();
+        dag.set_executors(extra_executor);
+        let batch_row_limit = self.get_batch_row_limit(false);
+        let quota_limiter = self.quota_limiter.clone();
+        let handler_builder: RequestHandlerBuilder<E::Snap> = Box::new(move |snap, req_ctx| {
+            let data_version = snap.ext().get_data_version();
+            let store = SnapshotStore::new(
+                snap,
+                start_ts.into(),
+                req_ctx.context.get_isolation_level(),
+                !req_ctx.context.get_not_fill_cache(),
+                req_ctx.bypass_locks.clone(),
+                req_ctx.access_locks.clone(),
+                req_is_cache_enabled,
+            );
+            dag::DagHandlerBuilder::new(
+                dag,
+                req_ctx.ranges.clone(),
+                store,
+                req_ctx.deadline,
+                batch_row_limit,
+                false,
+                req_is_cache_enabled,
+                None,
+                quota_limiter,
+            )
+            .data_version(data_version)
+            .build()
+        });
+        Ok((handler_builder, req_ctx))
+    }
+
     fn handle_index_lookup(
         &self,
         req: coppb::Request,
@@ -597,27 +888,24 @@ impl<E: Engine> Endpoint<E> {
         mut table_scan: TableScan,
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<coppb::Response>> {
-        // let req_ctx = ReqContext::new(
-        //     ReqTag::select,
-        //     req_ctx.context, // need update
-        //     req_ctx.ranges,  // need update
-        //     self.max_handle_duration,
-        //     peer,
-        //     Some(false),
-        //     start_ts.into(),
-        //     None,
-        //     self.perf_level,
-        // );
         // let check_lock = self.check_memory_locks(&req_ctx);
         let max_handle_duration = self.max_handle_duration;
         let perf_level = self.perf_level;
         let batch_row_limit = self.get_batch_row_limit(false);
         let quota_limiter = self.quota_limiter.clone();
 
+        let result_future = self.handle_extra_requests(
+            req.clone(),
+            peer.clone(),
+            resp.clone(),
+            schema.clone(),
+            table_scan.clone(),
+            start_ts,
+        );
         self.read_pool
             .spawn_handle(
                 async move {
-                    // check_lock?;
+                    result_future.await;
 
                     let mut sel = SelectResponse::default();
                     sel.merge_from_bytes(resp.get_data())
@@ -677,116 +965,116 @@ impl<E: Engine> Endpoint<E> {
                         table_prefix.extend(RECORD_PREFIX_SEP);
 
                         if !all_data.is_empty() {
-                            all_data.sort_by(|a, b| {
-                                let mut ctx = EvalContext::default();
-                                let l = min(a.len(), b.len());
-                                for i in 0..l {
-                                    if let Ok(ordering) = a[i].cmp(&mut ctx, &b[i]) {
-                                        if ordering != Ordering::Equal {
-                                            return ordering;
-                                        }
-                                    }
-                                }
-                                return a.len().cmp(&b.len());
-                            });
-                            let mut keys = Vec::with_capacity(all_data.len());
-                            for row in &all_data {
-                                let mut key;
-                                if schema_types.len() == 1
-                                    && matches!(
-                                        schema_types[0],
-                                        FieldTypeTp::Long | FieldTypeTp::LongLong
-                                    )
-                                {
-                                    let idx = match row[0] {
-                                        Datum::I64(x) => x,
-                                        Datum::U64(x) => x as i64,
-                                        _ => unreachable!(),
-                                    };
-                                    key = table_prefix.clone();
-                                    key.encode_i64(idx).unwrap();
-                                } else {
-                                    key = table_prefix.clone();
-                                    key.write_datum(&mut EvalContext::default(), row, true)
-                                        .unwrap();
-                                }
-                                keys.push(key);
-                            }
-                            keys.sort();
-                            let mut ranges: Vec<coppb::KeyRange> = Vec::new();
-                            let mut keep_indexes = Vec::new();
-                            let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
-                            for (i, key) in keys.into_iter().enumerate() {
-                                let key = Key::from_raw(&key);
-                                if let Some((region, peer_id, term)) = &last_region {
-                                    if util::check_key_in_region(key.as_encoded(), &region).is_ok()
-                                    {
-                                        let mut r = coppb::KeyRange::new();
-                                        r.set_start(key.as_encoded().to_vec());
-                                        r.set_end(r.get_start().to_vec());
-                                        convert_to_prefix_next(r.mut_end());
-                                        ranges.push(r);
-                                        info!("index lookup locate key"; "key" => ?key.as_encoded(),
-                                            "region" => region.id,
-                                            "peer" => peer_id,
-                                            "term" => term);
-                                        continue;
-                                    }
-                                    Self::build_extra_executor_fn(
-                                        req.clone(),
-                                        ranges.clone(),
-                                        peer.clone(),
-                                        region,
-                                        *peer_id,
-                                        *term,
-                                        start_ts,
-                                        max_handle_duration,
-                                        perf_level,
-                                        batch_row_limit,
-                                        quota_limiter.clone(),
-                                    ).await;
-                                    ranges.clear();
-                                }
-
-                                if let Some((region, peer_id, term)) = unsafe {
-                                    with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
-                                } {
-                                    last_region = Some((region.clone(), peer_id, term));
-                                    let mut r = coppb::KeyRange::new();
-                                    r.set_start(key.as_encoded().to_vec());
-                                    r.set_end(r.get_start().to_vec());
-                                    convert_to_prefix_next(r.mut_end());
-                                    ranges.push(r);
-                                    info!("index lookup locate key"; "key" => ?key.as_encoded(),
-                                            "region" => region.id,
-                                            "region_start_key" => ?region.start_key,
-                                            "region_end_key" => ?region.end_key,
-                                            "peer" => peer_id,
-                                            "term" => term);
-                                } else {
-                                    info!("index lookup not locate key"; "key" => ?key);
-                                    keep_indexes.push(i);
-                                }
-                            }
-                            if let Some((region, peer_id, term)) = &last_region {
-                                if ranges.len() > 0 {
-                                    if let Err(e) = Self::build_extra_executor_fn(
-                                        req.clone(),
-                                        ranges.clone(),
-                                        peer.clone(),
-                                        region,
-                                        *peer_id,
-                                        *term,
-                                        start_ts,
-                                        max_handle_duration,
-                                        perf_level,
-                                        batch_row_limit,
-                                        quota_limiter.clone(),
-                                    ).await{
-                                        info!("index lookup build extra executor failed"; "e" => ?e);
-                                    }
-                                }
-                            }
+                            // all_data.sort_by(|a, b| {
+                            //     let mut ctx = EvalContext::default();
+                            //     let l = min(a.len(), b.len());
+                            //     for i in 0..l {
+                            //         if let Ok(ordering) = a[i].cmp(&mut ctx, &b[i]) {
+                            //             if ordering != Ordering::Equal {
+                            //                 return ordering;
+                            //             }
+                            //         }
+                            //     }
+                            //     return a.len().cmp(&b.len());
+                            // });
+                            // let mut keys = Vec::with_capacity(all_data.len());
+                            // for row in &all_data {
+                            //     let mut key;
+                            //     if schema_types.len() == 1
+                            //         && matches!(
+                            //             schema_types[0],
+                            //             FieldTypeTp::Long | FieldTypeTp::LongLong
+                            //         )
+                            //     {
+                            //         let idx = match row[0] {
+                            //             Datum::I64(x) => x,
+                            //             Datum::U64(x) => x as i64,
+                            //             _ => unreachable!(),
+                            //         };
+                            //         key = table_prefix.clone();
+                            //         key.encode_i64(idx).unwrap();
+                            //     } else {
+                            //         key = table_prefix.clone();
+                            //         key.write_datum(&mut EvalContext::default(), row, true)
+                            //             .unwrap();
+                            //     }
+                            //     keys.push(key);
+                            // }
+                            // keys.sort();
+                            // let mut ranges: Vec<coppb::KeyRange> = Vec::new();
+                            // let mut keep_indexes = Vec::new();
+                            // let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
+                            // for (i, key) in keys.into_iter().enumerate() {
+                            //     let key = Key::from_raw(&key);
+                            //     if let Some((region, peer_id, term)) = &last_region {
+                            //         if util::check_key_in_region(key.as_encoded(),
+                            // &region).is_ok()         {
+                            //             let mut r = coppb::KeyRange::new();
+                            //             r.set_start(key.as_encoded().to_vec());
+                            //             r.set_end(r.get_start().to_vec());
+                            //             convert_to_prefix_next(r.mut_end());
+                            //             ranges.push(r);
+                            //             info!("index lookup locate key"; "key" =>
+                            // ?key.as_encoded(),                 
+                            // "region" => region.id,                 
+                            // "peer" => peer_id,                 "term"
+                            // => term);             continue;
+                            //         }
+                            //         Self::build_extra_executor_fn(
+                            //             req.clone(),
+                            //             ranges.clone(),
+                            //             peer.clone(),
+                            //             region,
+                            //             *peer_id,
+                            //             *term,
+                            //             start_ts,
+                            //             max_handle_duration,
+                            //             perf_level,
+                            //             batch_row_limit,
+                            //             quota_limiter.clone(),
+                            //         ).await;
+                            //         ranges.clear();
+                            //     }
+                            //
+                            //     if let Some((region, peer_id, term)) = unsafe {
+                            //         with_tls_engine(|e: &E| e.locate_key(key.as_encoded()))
+                            //     } {
+                            //         last_region = Some((region.clone(), peer_id, term));
+                            //         let mut r = coppb::KeyRange::new();
+                            //         r.set_start(key.as_encoded().to_vec());
+                            //         r.set_end(r.get_start().to_vec());
+                            //         convert_to_prefix_next(r.mut_end());
+                            //         ranges.push(r);
+                            //         info!("index lookup locate key"; "key" => ?key.as_encoded(),
+                            //                 "region" => region.id,
+                            //                 "region_start_key" => ?region.start_key,
+                            //                 "region_end_key" => ?region.end_key,
+                            //                 "peer" => peer_id,
+                            //                 "term" => term);
+                            //     } else {
+                            //         info!("index lookup not locate key"; "key" => ?key);
+                            //         keep_indexes.push(i);
+                            //     }
+                            // }
+                            // if let Some((region, peer_id, term)) = &last_region {
+                            //     if ranges.len() > 0 {
+                            //         if let Err(e) = Self::build_extra_executor_fn(
+                            //             req.clone(),
+                            //             ranges.clone(),
+                            //             peer.clone(),
+                            //             region,
+                            //             *peer_id,
+                            //             *term,
+                            //             start_ts,
+                            //             max_handle_duration,
+                            //             perf_level,
+                            //             batch_row_limit,
+                            //             quota_limiter.clone(),
+                            //         ).await{
+                            //             info!("index lookup build extra executor failed"; "e" =>
+                            // ?e);         }
+                            //     }
+                            // }
 
                             let snapshot = unsafe {
                                 with_tls_engine(|e: &E| e.snapshot_on_kv_engine(&[], &[])).unwrap()
