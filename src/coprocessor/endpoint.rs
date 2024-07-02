@@ -905,6 +905,8 @@ impl<E: Engine> Endpoint<E> {
         let mut input = CodedInputStream::from_bytes(data);
         box_try!(dag.merge_from(&mut input));
         let extra_executor = dag.take_extra_executors();
+        dag.set_executors(extra_executor);
+        let extra_executor = dag.get_executors();
         if extra_executor.len() > 0 {
             info!("index lookup build extra executor";
             "ranges" => ?req_ctx.ranges,
@@ -917,7 +919,6 @@ impl<E: Engine> Endpoint<E> {
             "extra_executor0_cols" => extra_executor[0].get_tbl_scan().get_columns().len(),
             "dag" => ?dag);
         }
-        dag.set_executors(extra_executor);
         let batch_row_limit = self.get_batch_row_limit(false);
         let quota_limiter = self.quota_limiter.clone();
         let handler_builder: RequestHandlerBuilder<E::Snap> = Box::new(move |snap, req_ctx| {
@@ -931,7 +932,7 @@ impl<E: Engine> Endpoint<E> {
                 req_ctx.access_locks.clone(),
                 req_is_cache_enabled,
             );
-            dag::DagHandlerBuilder::new(
+            let handler = dag::DagHandlerBuilder::new(
                 dag,
                 req_ctx.ranges.clone(),
                 store,
@@ -943,7 +944,12 @@ impl<E: Engine> Endpoint<E> {
                 quota_limiter,
             )
             .data_version(data_version)
-            .build()
+            .build();
+
+            if let Ok(e) = &handler{
+                info!("index lookup build extra executor 2"; "handler_schema" => ?e.get_schema());
+            }
+            handler
         });
         Ok((handler_builder, req_ctx))
     }

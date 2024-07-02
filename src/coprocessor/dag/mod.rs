@@ -151,6 +151,10 @@ impl RequestHandler for BatchDagHandler {
     fn get_req(&self) -> Option<DagRequest> {
         self.req.clone()
     }
+
+    fn get_schema(&self) -> Option<Vec<FieldType>> {
+        Some(self.runner.schema().to_vec())
+    }
 }
 
 fn handle_qe_response(

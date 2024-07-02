@@ -98,6 +98,10 @@ pub trait RequestHandler: Send {
     fn get_req(&self) -> Option<DagRequest> {
         None
     }
+
+    fn get_schema(&self) -> Option<Vec<FieldType>> {
+        None
+    }
 }
 
 type RequestHandlerBuilder<Snap> =
