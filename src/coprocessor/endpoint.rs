@@ -584,19 +584,14 @@ impl<E: Engine> Endpoint<E> {
 
     fn build_extra_executor_range(
         &self,
-        mut resp: coppb::Response,
+        mut sel: &SelectResponse,
         schema: Vec<FieldType>,
         mut table_scan: TableScan,
     ) -> Option<(
         Vec<(Vec<coppb::KeyRange>, Arc<metapb::Region>, u64, u64)>,
         Vec<usize>,
     )> {
-        // let check_lock = self.check_memory_locks(&req_ctx);
-        // build extra executor ranges.
-        let mut sel = SelectResponse::default();
-        if sel.merge_from_bytes(resp.get_data()).is_ok()
-            && sel.get_encode_type() == EncodeType::TypeChunk
-        {
+        if sel.get_encode_type() == EncodeType::TypeChunk {
             let schema_types: Vec<_> = schema
                 .iter()
                 .map(|ft| {
@@ -744,37 +739,60 @@ impl<E: Engine> Endpoint<E> {
         &self,
         req: coppb::Request,
         peer: Option<String>,
-        resp: coppb::Response,
+        mut resp: coppb::Response,
         schema: Vec<FieldType>,
         table_scan: TableScan,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+    ) -> impl Future<Output = Result<coppb::Response>> {
+        let mut sel = SelectResponse::default();
         let mut result_futures = Vec::new();
-        if let Some((ranges_groups, keep_indexes)) =
-            self.build_extra_executor_range(resp, schema, table_scan)
-        {
-            for range_group in ranges_groups {
-                let (ranges, region, peer_id, term) = range_group;
-                let range_result = self.handle_extra_request(
-                    req.clone(),
-                    ranges,
-                    peer.clone(),
-                    region,
-                    peer_id,
-                    term,
-                    start_ts,
-                );
-                result_futures.push(range_result);
+        if sel.merge_from_bytes(resp.get_data()).is_ok() {
+            if let Some((ranges_groups, keep_indexes)) =
+                self.build_extra_executor_range(&mut sel, schema, table_scan)
+            {
+                for range_group in ranges_groups {
+                    let (ranges, region, peer_id, term) = range_group;
+                    let range_result = self.handle_extra_request(
+                        req.clone(),
+                        ranges,
+                        peer.clone(),
+                        region,
+                        peer_id,
+                        term,
+                        start_ts,
+                    );
+                    result_futures.push(range_result);
+                }
             }
         }
+
         async move {
-            let mut resps = Vec::new();
+            // let mut schema_types = Vec::new();
             for result in result_futures {
-                let resp = result.await;
-                info!("get extra req resp"; "data.len" => resp.data.len());
-                resps.push(resp);
+                let (extra_resp, extra_schema) = result.await;
+                info!("get extra req resp"; "data.len" => extra_resp.data.len(), "schema.len" => extra_schema.len());
+                // if schema_types.is_empty() {
+                //     schema_types = extra_schema
+                //         .iter()
+                //         .map(|ft| {
+                //             FieldTypeTp::from_u8(ft.get_tp() as u8)
+                //                 .unwrap_or(FieldTypeTp::Unspecified)
+                //         })
+                //         .collect();
+                // }
+                let mut extra_sel = SelectResponse::default();
+                if extra_sel.merge_from_bytes(extra_resp.get_data()).is_ok() {
+                    let extra_chunks = extra_sel.take_chunks().to_vec();
+                    let mut total_chunks = sel.take_extra_chunks();
+                    for chk in extra_chunks {
+                        total_chunks.push(chk);
+                    }
+                    sel.set_extra_chunks(total_chunks);
+                    sel.clear_chunks();
+                }
             }
-            MemoryTraceGuard::from(coppb::Response::new())
+            resp.set_data(sel.write_to_bytes().unwrap());
+            Ok(resp)
         }
     }
 
@@ -787,22 +805,24 @@ impl<E: Engine> Endpoint<E> {
         peer_id: u64,
         term: u64,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+    ) -> impl Future<Output = (MemoryTraceGuard<coppb::Response>, Vec<FieldType>)> {
         let result_of_future = self
             .parse_extra_requests(req, ranges, peer, region.clone(), peer_id, term, start_ts)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
 
         async move {
             let handle_fut = match result_of_future {
-                Err(e) => return make_error_response(e).into(),
+                Err(e) => return (make_error_response(e).into(), Vec::new()),
                 Ok(handle_fut) => handle_fut,
             };
             let (mut resp, index_lookup, req_ctx) = match handle_fut.await {
-                Err(e) => return make_error_response(e).into(),
+                Err(e) => return (make_error_response(e).into(), Vec::new()),
                 Ok(response) => response,
             };
             // print resp value for debug
-            if let Some((schema,_)) = index_lookup {
+            let mut extra_schema = Vec::new();
+            if let Some((schema, _)) = index_lookup {
+                extra_schema = schema.clone();
                 let mut sel = SelectResponse::default();
                 sel.merge_from_bytes(resp.get_data())
                     .expect("fail to recover SelectResponse");
@@ -849,9 +869,9 @@ impl<E: Engine> Endpoint<E> {
                             let mut row = Vec::new();
                             for (j, ft) in schema.iter().enumerate() {
                                 let v = columns[j].get_datum(i, ft).expect("fail to get datum");
-                                if let Ok(str) = v.to_string(){
+                                if let Ok(str) = v.to_string() {
                                     row.push(str);
-                                }else{
+                                } else {
                                     row.push("".to_string());
                                 }
                                 dt.push(v);
@@ -862,8 +882,8 @@ impl<E: Engine> Endpoint<E> {
                     }
                 }
             }
-            info!("handle extra req finish"; "resp.data.len" => resp.data.len());
-            resp
+            info!("handle extra req finish"; "resp.data.len" => resp.data.len(), "extra_schema.len" => extra_schema.len());
+            (resp, extra_schema)
         }
     }
 
@@ -952,7 +972,7 @@ impl<E: Engine> Endpoint<E> {
             .data_version(data_version)
             .build();
 
-            if let Ok(e) = &handler{
+            if let Ok(e) = &handler {
                 info!("index lookup build extra executor 2"; "handler_schema" => ?e.get_schema());
             }
             handler
@@ -986,209 +1006,237 @@ impl<E: Engine> Endpoint<E> {
         self.read_pool
             .spawn_handle(
                 async move {
-                    result_future.await;
+                    result_future.await
 
-                    let mut sel = SelectResponse::default();
-                    sel.merge_from_bytes(resp.get_data())
-                        .expect("fail to recover SelectResponse");
-                    if sel.get_encode_type() == EncodeType::TypeChunk {
-                        let schema_types: Vec<_> = schema
-                            .iter()
-                            .map(|ft| {
-                                FieldTypeTp::from_u8(ft.get_tp() as u8)
-                                    .unwrap_or(FieldTypeTp::Unspecified)
-                            })
-                            .collect();
-                        // info!("schema"; "schema" => ?schema_types);
-                        let mut all_data = Vec::new();
-                        'outer: for chunk in sel.get_chunks() {
-                            let mut data = chunk.get_rows_data();
-                            if data.is_empty() {
-                                continue;
-                            }
-                            let mut columns = Vec::with_capacity(schema.len());
-                            for ft in &schema {
-                                if data.is_empty() {
-                                    continue;
-                                }
-                                let col = match Column::decode(
-                                    &mut data,
-                                    FieldTypeTp::from_u8(ft.get_tp() as u8)
-                                        .unwrap_or(FieldTypeTp::Unspecified),
-                                ) {
-                                    Ok(col) => col,
-                                    Err(e) => {
-                                        info!("decode chunk error"; "err" => ?e);
-                                        break 'outer;
-                                    }
-                                };
-                                columns.push(col);
-                            }
-                            if columns.is_empty() {
-                                continue;
-                            }
-                            let len = columns[0].len();
-
-                            for i in 0..len {
-                                let mut dt = Vec::new();
-                                for (j, ft) in schema.iter().enumerate() {
-                                    dt.push(
-                                        columns[j].get_datum(i, ft).expect("fail to get datum"),
-                                    );
-                                }
-                                all_data.push(dt);
-                            }
-                        }
-                        // info!("chunk datum!"; "dt" => ?all_data);
-                        let mut table_prefix = vec![];
-                        table_prefix.extend(TABLE_PREFIX);
-                        table_prefix.encode_i64(table_scan.get_table_id()).unwrap();
-                        table_prefix.extend(RECORD_PREFIX_SEP);
-
-                        if !all_data.is_empty() {
-                            let snapshot = unsafe {
-                                with_tls_engine(|e: &E| e.snapshot_on_kv_engine(&[], &[])).unwrap()
-                            };
-                            let mut point_getter =
-                                PointGetterBuilder::new(snapshot, start_ts).build().unwrap();
-                            let mut pairs = Vec::new();
-                            if schema_types.len() == 1
-                                && matches!(
-                                    schema_types[0],
-                                    FieldTypeTp::Long | FieldTypeTp::LongLong
-                                )
-                            {
-                                for idx in &all_data {
-                                    let idx = match idx[0] {
-                                        Datum::I64(x) => x,
-                                        Datum::U64(x) => x as i64,
-                                        _ => unreachable!(),
-                                    };
-                                    let mut key = table_prefix.clone();
-                                    key.encode_i64(idx).unwrap();
-                                    let key = Key::from_raw(&key);
-                                    let value = point_getter.get(&key).ok().flatten();
-                                    pairs.push((key, value));
-                                }
-                            } else {
-                                for row in &all_data {
-                                    let mut key = table_prefix.clone();
-                                    key.write_datum(&mut EvalContext::default(), row, true)
-                                        .unwrap();
-                                    let key = Key::from_raw(&key);
-                                    let value = point_getter.get(&key).ok().flatten();
-                                    pairs.push((key, value));
-                                }
-                            }
-
-                            // let all_values: Vec<_> = pairs
-                            //     .iter()
-                            //     .map(|(k, v)| (k, v.as_ref().map(|v| hex::encode_upper(v))))
-                            //     .collect();
-                            // info!("all values"; "values" => ?all_values);
-
-                            let columns_info: Vec<ColumnInfo> = table_scan.take_columns().into();
-                            let primary_column_ids = table_scan.take_primary_column_ids();
-                            let is_column_filled = vec![false; columns_info.len()];
-                            let mut handle_indices = HandleIndicesVec::new();
-                            let mut schema = Vec::with_capacity(columns_info.len());
-                            let mut columns_default_value = Vec::with_capacity(columns_info.len());
-                            let mut column_id_index = HashMap::default();
-
-                            for (index, mut ci) in columns_info.into_iter().enumerate() {
-                                // For each column info, we need to extract the following info:
-                                // - Corresponding field type (push into `schema`).
-                                schema.push(field_type_from_column_info(&ci));
-
-                                // - Prepare column default value (will be used to fill missing
-                                //   column later).
-                                columns_default_value.push(ci.take_default_val());
-
-                                // - Store the index of the PK handles.
-                                // - Check whether or not we don't need KV values (iff PK handle is
-                                //   given).
-                                if ci.get_pk_handle() {
-                                    handle_indices.push(index);
-                                } else {
-                                    column_id_index.insert(ci.get_column_id(), index);
-                                }
-
-                                // Note: if two PK handles are given, we will
-                                // only preserve
-                                // the *last* one. Also
-                                // if two columns with the same
-                                // column id are given, we
-                                // will only preserve the *last* one.
-                            }
-
-                            let mut imp = TableScanExecutorImpl {
-                                context: EvalContext::default(),
-                                schema: schema.clone(),
-                                columns_default_value,
-                                column_id_index,
-                                handle_indices,
-                                primary_column_ids,
-                                is_column_filled,
-                            };
-                            let mut success = true;
-                            let mut columns = imp.build_column_vec(pairs.len());
-                            let mut keep_indexes = Vec::new();
-                            for (i, (k, v)) in pairs.into_iter().enumerate() {
-                                if let Some(v) = v {
-                                    let raw = k.to_raw().unwrap();
-                                    if let Err(_e) = imp.process_kv_pair(&raw, &v, &mut columns) {
-                                        // info!("process kv pair error"; "err" => ?e);
-                                        success = false;
-                                        break;
-                                    }
-                                } else {
-                                    keep_indexes.push(i);
-                                }
-                            }
-                            if success {
-                                // info!("process done"; "columns" => ?columns, "keep_indexes" =>
-                                // ?keep_indexes);
-                                if keep_indexes.is_empty() {
-                                    sel.clear_chunks();
-                                } else {
-                                    let mut new_index_columns = Vec::new();
-                                    for tp in schema_types {
-                                        new_index_columns.push(Column::new(tp, keep_indexes.len()));
-                                    }
-                                    for i in keep_indexes {
-                                        for (col_idx, dt) in all_data[i].iter().enumerate() {
-                                            new_index_columns[col_idx].append_datum(&dt).unwrap();
-                                        }
-                                    }
-                                    let mut index_chunk = Chunk::default();
-                                    for col in new_index_columns {
-                                        index_chunk
-                                            .mut_rows_data()
-                                            .write_chunk_column(&col)
-                                            .unwrap();
-                                    }
-                                    sel.set_chunks(vec![index_chunk].into());
-                                }
-
-                                let mut row_chunk = Chunk::default();
-                                let logical: Vec<_> = (0..columns.rows_len()).collect();
-                                let offsets: Vec<_> = (0..schema.len()).map(|x| x as u32).collect();
-                                // info!("extra chunk"; "chunk" => ?columns);
-                                columns
-                                    .encode_chunk(
-                                        &logical,
-                                        &offsets,
-                                        &schema,
-                                        row_chunk.mut_rows_data(),
-                                        &mut EvalContext::default(),
-                                    )
-                                    .unwrap();
-                                sel.set_extra_chunks(vec![row_chunk].into());
-                                resp.set_data(sel.write_to_bytes().unwrap());
-                            }
-                        }
-                    }
-                    Ok(resp)
+                    // let mut sel = SelectResponse::default();
+                    // sel.merge_from_bytes(resp.get_data())
+                    //     .expect("fail to recover SelectResponse");
+                    // if sel.get_encode_type() == EncodeType::TypeChunk {
+                    //     let schema_types: Vec<_> = schema
+                    //         .iter()
+                    //         .map(|ft| {
+                    //             FieldTypeTp::from_u8(ft.get_tp() as u8)
+                    //                 .unwrap_or(FieldTypeTp::Unspecified)
+                    //         })
+                    //         .collect();
+                    //     // info!("schema"; "schema" => ?schema_types);
+                    //     let mut all_data = Vec::new();
+                    //     'outer: for chunk in sel.get_chunks() {
+                    //         let mut data = chunk.get_rows_data();
+                    //         if data.is_empty() {
+                    //             continue;
+                    //         }
+                    //         let mut columns =
+                    // Vec::with_capacity(schema.len());
+                    //         for ft in &schema {
+                    //             if data.is_empty() {
+                    //                 continue;
+                    //             }
+                    //             let col = match Column::decode(
+                    //                 &mut data,
+                    //                 FieldTypeTp::from_u8(ft.get_tp() as u8)
+                    //                     .unwrap_or(FieldTypeTp::Unspecified),
+                    //             ) {
+                    //                 Ok(col) => col,
+                    //                 Err(e) => {
+                    //                     info!("decode chunk error"; "err" =>
+                    // ?e);                     break
+                    // 'outer;                 }
+                    //             };
+                    //             columns.push(col);
+                    //         }
+                    //         if columns.is_empty() {
+                    //             continue;
+                    //         }
+                    //         let len = columns[0].len();
+                    //
+                    //         for i in 0..len {
+                    //             let mut dt = Vec::new();
+                    //             for (j, ft) in schema.iter().enumerate() {
+                    //                 dt.push(
+                    //                     columns[j].get_datum(i,
+                    // ft).expect("fail to get datum"),
+                    //                 );
+                    //             }
+                    //             all_data.push(dt);
+                    //         }
+                    //     }
+                    //     // info!("chunk datum!"; "dt" => ?all_data);
+                    //     let mut table_prefix = vec![];
+                    //     table_prefix.extend(TABLE_PREFIX);
+                    //     table_prefix.encode_i64(table_scan.get_table_id()).
+                    // unwrap();     table_prefix.
+                    // extend(RECORD_PREFIX_SEP);
+                    //
+                    //     if !all_data.is_empty() {
+                    //         let snapshot = unsafe {
+                    //             with_tls_engine(|e: &E|
+                    // e.snapshot_on_kv_engine(&[], &[])).unwrap()
+                    //         };
+                    //         let mut point_getter =
+                    //             PointGetterBuilder::new(snapshot,
+                    // start_ts).build().unwrap();
+                    //         let mut pairs = Vec::new();
+                    //         if schema_types.len() == 1
+                    //             && matches!(
+                    //                 schema_types[0],
+                    //                 FieldTypeTp::Long | FieldTypeTp::LongLong
+                    //             )
+                    //         {
+                    //             for idx in &all_data {
+                    //                 let idx = match idx[0] {
+                    //                     Datum::I64(x) => x,
+                    //                     Datum::U64(x) => x as i64,
+                    //                     _ => unreachable!(),
+                    //                 };
+                    //                 let mut key = table_prefix.clone();
+                    //                 key.encode_i64(idx).unwrap();
+                    //                 let key = Key::from_raw(&key);
+                    //                 let value =
+                    // point_getter.get(&key).ok().flatten();
+                    //                 pairs.push((key, value));
+                    //             }
+                    //         } else {
+                    //             for row in &all_data {
+                    //                 let mut key = table_prefix.clone();
+                    //                 key.write_datum(&mut
+                    // EvalContext::default(), row, true)
+                    //                     .unwrap();
+                    //                 let key = Key::from_raw(&key);
+                    //                 let value =
+                    // point_getter.get(&key).ok().flatten();
+                    //                 pairs.push((key, value));
+                    //             }
+                    //         }
+                    //
+                    //         // let all_values: Vec<_> = pairs
+                    //         //     .iter()
+                    //         //     .map(|(k, v)| (k, v.as_ref().map(|v|
+                    // hex::encode_upper(v))))         //
+                    // .collect();         // info!("all
+                    // values"; "values" => ?all_values);
+                    //
+                    //         let columns_info: Vec<ColumnInfo> =
+                    // table_scan.take_columns().into();
+                    //         let primary_column_ids =
+                    // table_scan.take_primary_column_ids();
+                    //         let is_column_filled = vec![false;
+                    // columns_info.len()];         let mut
+                    // handle_indices = HandleIndicesVec::new();
+                    //         let mut schema =
+                    // Vec::with_capacity(columns_info.len());
+                    //         let mut columns_default_value =
+                    // Vec::with_capacity(columns_info.len());
+                    //         let mut column_id_index = HashMap::default();
+                    //
+                    //         for (index, mut ci) in
+                    // columns_info.into_iter().enumerate() {
+                    //             // For each column info, we need to extract
+                    // the following info:             // -
+                    // Corresponding field type (push into `schema`).
+                    //
+                    // schema.push(field_type_from_column_info(&ci));
+                    //
+                    //             // - Prepare column default value (will be
+                    // used to fill missing             //
+                    // column later).
+                    // columns_default_value.push(ci.take_default_val());
+                    //
+                    //             // - Store the index of the PK handles.
+                    //             // - Check whether or not we don't need KV
+                    // values (iff PK handle is
+                    // //   given).             if
+                    // ci.get_pk_handle() {
+                    // handle_indices.push(index);
+                    //             } else {
+                    //
+                    // column_id_index.insert(ci.get_column_id(), index);
+                    //             }
+                    //
+                    //             // Note: if two PK handles are given, we will
+                    //             // only preserve
+                    //             // the *last* one. Also
+                    //             // if two columns with the same
+                    //             // column id are given, we
+                    //             // will only preserve the *last* one.
+                    //         }
+                    //
+                    //         let mut imp = TableScanExecutorImpl {
+                    //             context: EvalContext::default(),
+                    //             schema: schema.clone(),
+                    //             columns_default_value,
+                    //             column_id_index,
+                    //             handle_indices,
+                    //             primary_column_ids,
+                    //             is_column_filled,
+                    //         };
+                    //         let mut success = true;
+                    //         let mut columns =
+                    // imp.build_column_vec(pairs.len());
+                    //         let mut keep_indexes = Vec::new();
+                    //         for (i, (k, v)) in pairs.into_iter().enumerate()
+                    // {             if let Some(v) = v {
+                    //                 let raw = k.to_raw().unwrap();
+                    //                 if let Err(_e) =
+                    // imp.process_kv_pair(&raw, &v, &mut columns) {
+                    //                     // info!("process kv pair error";
+                    // "err" => ?e);
+                    // success = false;
+                    // break;                 }
+                    //             } else {
+                    //                 keep_indexes.push(i);
+                    //             }
+                    //         }
+                    //         if success {
+                    //             // info!("process done"; "columns" =>
+                    // ?columns, "keep_indexes" =>
+                    //             // ?keep_indexes);
+                    //             if keep_indexes.is_empty() {
+                    //                 sel.clear_chunks();
+                    //             } else {
+                    //                 let mut new_index_columns = Vec::new();
+                    //                 for tp in schema_types {
+                    //
+                    // new_index_columns.push(Column::new(tp,
+                    // keep_indexes.len()));
+                    // }                 for i in
+                    // keep_indexes {
+                    // for (col_idx, dt) in all_data[i].iter().enumerate() {
+                    //
+                    // new_index_columns[col_idx].append_datum(&dt).unwrap();
+                    //                     }
+                    //                 }
+                    //                 let mut index_chunk = Chunk::default();
+                    //                 for col in new_index_columns {
+                    //                     index_chunk
+                    //                         .mut_rows_data()
+                    //                         .write_chunk_column(&col)
+                    //                         .unwrap();
+                    //                 }
+                    //                 sel.set_chunks(vec![index_chunk].into());
+                    //             }
+                    //
+                    //             let mut row_chunk = Chunk::default();
+                    //             let logical: Vec<_> =
+                    // (0..columns.rows_len()).collect();
+                    //             let offsets: Vec<_> =
+                    // (0..schema.len()).map(|x| x as u32).collect();
+                    //             // info!("extra chunk"; "chunk" => ?columns);
+                    //             columns
+                    //                 .encode_chunk(
+                    //                     &logical,
+                    //                     &offsets,
+                    //                     &schema,
+                    //                     row_chunk.mut_rows_data(),
+                    //                     &mut EvalContext::default(),
+                    //                 )
+                    //                 .unwrap();
+                    //             sel.set_extra_chunks(vec![row_chunk].into());
+                    //             resp.set_data(sel.write_to_bytes().unwrap());
+                    //         }
+                    //     }
+                    // }
+                    // Ok(resp)
                 },
                 CommandPri::Normal,
                 0,
