@@ -802,7 +802,7 @@ impl<E: Engine> Endpoint<E> {
                 Ok(response) => response,
             };
             // print resp value for debug
-            if let Some((schema, table_info)) = index_lookup {
+            if let Some((schema,_)) = index_lookup {
                 let mut sel = SelectResponse::default();
                 sel.merge_from_bytes(resp.get_data())
                     .expect("fail to recover SelectResponse");
@@ -814,7 +814,7 @@ impl<E: Engine> Endpoint<E> {
                                 .unwrap_or(FieldTypeTp::Unspecified)
                         })
                         .collect();
-                    // info!("schema"; "schema" => ?schema_types);
+                    info!("extra req schema"; "schema" => ?schema_types, "schema.len" => schema_types.len());
                     let mut all_data = Vec::new();
                     'outer: for chunk in sel.get_chunks() {
                         let mut data = chunk.get_rows_data();
@@ -852,7 +852,7 @@ impl<E: Engine> Endpoint<E> {
                                 row.push(v.to_string().unwrap());
                                 dt.push(v);
                             }
-                            info!("extra resp"; "row" => ?row);
+                            info!("extra resp"; "row" => ?row, "row.len" => row.len());
                             all_data.push(dt);
                         }
                     }
