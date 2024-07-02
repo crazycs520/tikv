@@ -906,6 +906,14 @@ impl<E: Engine> Endpoint<E> {
         box_try!(dag.merge_from(&mut input));
         let extra_executor = dag.take_extra_executors();
         dag.set_executors(extra_executor);
+        if dag.get_extra_executors().len() > 0 {
+            let mut offset = Vec::new();
+            let schema_len = dag.get_extra_executors()[0].get_tbl_scan().get_columns().len();
+            for i in 0.. schema_len {
+                offset.push(i as u32);
+            }
+            dag.set_output_offsets(offset);
+        }
         let extra_executor = dag.get_executors();
         if extra_executor.len() > 0 {
             info!("index lookup build extra executor";
