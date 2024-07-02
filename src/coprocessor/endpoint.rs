@@ -771,7 +771,7 @@ impl<E: Engine> Endpoint<E> {
             let mut resps = Vec::new();
             for result in result_futures {
                 let resp = result.await;
-                info!("get extra req resp"; "data" =>                 resp.data.len());
+                info!("get extra req resp"; "data.len" => resp.data.len());
                 resps.push(resp);
             }
             MemoryTraceGuard::from(coppb::Response::new())
@@ -898,12 +898,6 @@ impl<E: Engine> Endpoint<E> {
             None,
             self.perf_level,
         );
-        info!("index lookup build extra executor";
-            "ranges" => ?req_ctx.ranges,
-            "region" => region.id,
-            "peer" => peer_id,
-            "term" => term);
-
         self.check_memory_locks(&req_ctx)?;
         let mut dag = DagRequest::default();
         let data = req.get_data().clone();
@@ -911,6 +905,16 @@ impl<E: Engine> Endpoint<E> {
         let mut input = CodedInputStream::from_bytes(data);
         box_try!(dag.merge_from(&mut input));
         let extra_executor = dag.take_extra_executors();
+        if extra_executor.len() > 0 {
+            info!("index lookup build extra executor";
+            "ranges" => ?req_ctx.ranges,
+            "region" => region.id,
+            "peer" => peer_id,
+            "term" => term,
+            "extra_executor.len" => extra_executor.len(),
+            "extra_executor_id" => extra_executor[0].get_executor_id(),
+            "extra_executor_tp" => ?extra_executor[0].get_tp());
+        }
         dag.set_executors(extra_executor);
         let batch_row_limit = self.get_batch_row_limit(false);
         let quota_limiter = self.quota_limiter.clone();
