@@ -933,18 +933,18 @@ impl<E: Engine> Endpoint<E> {
         dag.set_output_offsets(extra_output_offset);
         dag.set_executors(extra_executor);
         let extra_executor = dag.get_executors();
-        if extra_executor.len() > 0 {
-            info!("index lookup build extra executor";
-            "ranges" => ?req_ctx.ranges,
-            "region" => region.id,
-            "peer" => peer_id,
-            "term" => term,
-            "extra_executor.len" => extra_executor.len(),
-            "extra_executor_id" => extra_executor[0].get_executor_id(),
-            "extra_executor_tp" => ?extra_executor[0].get_tp(),
-            "extra_executor0_cols" => extra_executor[0].get_tbl_scan().get_columns().len(),
-            "dag" => ?dag);
-        }
+        // if extra_executor.len() > 0 {
+        //     info!("index lookup build extra executor";
+        //     "ranges" => ?req_ctx.ranges,
+        //     "region" => region.id,
+        //     "peer" => peer_id,
+        //     "term" => term,
+        //     "extra_executor.len" => extra_executor.len(),
+        //     "extra_executor_id" => extra_executor[0].get_executor_id(),
+        //     "extra_executor_tp" => ?extra_executor[0].get_tp(),
+        //     "extra_executor0_cols" =>
+        // extra_executor[0].get_tbl_scan().get_columns().len(),     "dag" =>
+        // ?dag); }
         let batch_row_limit = self.get_batch_row_limit(false);
         let quota_limiter = self.quota_limiter.clone();
         let handler_builder: RequestHandlerBuilder<E::Snap> = Box::new(move |snap, req_ctx| {
@@ -972,9 +972,9 @@ impl<E: Engine> Endpoint<E> {
             .data_version(data_version)
             .build();
 
-            if let Ok(e) = &handler {
-                info!("index lookup build extra executor 2"; "handler_schema" => ?e.get_schema());
-            }
+            // if let Ok(e) = &handler {
+            //     info!("index lookup build extra executor 2"; "handler_schema" =>
+            // ?e.get_schema()); }
             handler
         });
         Ok((handler_builder, req_ctx))
