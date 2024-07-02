@@ -913,7 +913,9 @@ impl<E: Engine> Endpoint<E> {
             "term" => term,
             "extra_executor.len" => extra_executor.len(),
             "extra_executor_id" => extra_executor[0].get_executor_id(),
-            "extra_executor_tp" => ?extra_executor[0].get_tp());
+            "extra_executor_tp" => ?extra_executor[0].get_tp(),
+            "extra_executor0_cols" => extra_executor[0].get_tbl_scan().get_columns().len(),
+            "dag" => ?dag);
         }
         dag.set_executors(extra_executor);
         let batch_row_limit = self.get_batch_row_limit(false);

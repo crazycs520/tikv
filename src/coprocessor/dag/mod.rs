@@ -121,17 +121,6 @@ impl BatchDagHandler {
             index_lookup,
         })
     }
-
-    // fn build_extra_dag_handler<S: Store + 'static>(
-    //     &self,
-    //     ranges: Vec<KeyRange>,
-    //     store: S,
-    //     data_version: Option<u64>,
-    //     deadline: Deadline,
-    //     quota_limiter: Arc<QuotaLimiter>,
-    // ) -> Result<Self> {
-    //     unimplemented!()
-    // }
 }
 
 #[async_trait]
