@@ -849,7 +849,11 @@ impl<E: Engine> Endpoint<E> {
                             let mut row = Vec::new();
                             for (j, ft) in schema.iter().enumerate() {
                                 let v = columns[j].get_datum(i, ft).expect("fail to get datum");
-                                row.push(v.to_string().unwrap());
+                                if let Ok(str) = v.to_string(){
+                                    row.push(str);
+                                }else{
+                                    row.push("".to_string());
+                                }
                                 dt.push(v);
                             }
                             info!("extra resp"; "row" => ?row, "row.len" => row.len());
