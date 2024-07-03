@@ -794,7 +794,7 @@ impl<E: Engine> Endpoint<E> {
         async move {
             if result_futures.len() == 0 {
                 // fast return.
-                info!("no extra task need to do"; "keep_index.len" => keep_index.len());
+                // info!("no extra task need to do"; "keep_index.len" => keep_index.len());
                 return Ok(resp);
             }
             let mut total_chunks = sel.take_extra_chunks();
