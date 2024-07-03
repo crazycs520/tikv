@@ -37,14 +37,17 @@ mod slow_hash_aggr_executor;
 mod stream_aggr_executor;
 mod table_scan_executor;
 mod top_n_executor;
-mod util;
+pub mod util;
 
 pub use self::{
     fast_hash_aggr_executor::BatchFastHashAggregationExecutor,
-    index_scan_executor::BatchIndexScanExecutor, limit_executor::BatchLimitExecutor,
-    projection_executor::BatchProjectionExecutor, selection_executor::BatchSelectionExecutor,
+    index_scan_executor::BatchIndexScanExecutor,
+    limit_executor::BatchLimitExecutor,
+    projection_executor::BatchProjectionExecutor,
+    selection_executor::BatchSelectionExecutor,
     simple_aggr_executor::BatchSimpleAggregationExecutor,
     slow_hash_aggr_executor::BatchSlowHashAggregationExecutor,
     stream_aggr_executor::BatchStreamAggregationExecutor,
-    table_scan_executor::BatchTableScanExecutor, top_n_executor::BatchTopNExecutor,
+    table_scan_executor::{BatchTableScanExecutor, HandleIndicesVec, TableScanExecutorImpl},
+    top_n_executor::BatchTopNExecutor,
 };

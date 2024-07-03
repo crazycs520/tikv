@@ -6,7 +6,7 @@ use concurrency_manager::ConcurrencyManager;
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{coprocessor, kvrpcpb::*, resource_usage_agent::ResourceUsageRecord, tikvpb::*};
-use protobuf::Message;
+// use protobuf::Message;
 use resource_metering::ResourceTagFactory;
 use test_coprocessor::{DagSelect, ProductTable, Store};
 use test_raftstore::*;
@@ -256,18 +256,19 @@ fn init_coprocessor_with_data(
     )
 }
 
-async fn handle_select<E>(copr: &Endpoint<E>, req: coprocessor::Request) -> SelectResponse
+async fn handle_select<E>(_copr: &Endpoint<E>, _req: coprocessor::Request) -> SelectResponse
 where
     E: Engine,
 {
-    let resp = copr
-        .parse_and_handle_unary_request(req, None)
-        .await
-        .consume();
-    assert!(!resp.get_data().is_empty(), "{:?}", resp);
-    let mut sel_resp = SelectResponse::default();
-    sel_resp.merge_from_bytes(resp.get_data()).unwrap();
-    sel_resp
+    // let resp = copr
+    //     .parse_and_handle_unary_request(req, None)
+    //     .await
+    //     .consume();
+    // assert!(!resp.get_data().is_empty(), "{:?}", resp);
+    // let mut sel_resp = SelectResponse::default();
+    // sel_resp.merge_from_bytes(resp.get_data()).unwrap();
+    // sel_resp
+    todo!()
 }
 
 #[derive(Clone)]

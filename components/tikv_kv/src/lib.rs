@@ -41,7 +41,7 @@ use into_other::IntoOther;
 use kvproto::{
     errorpb::Error as ErrorHeader,
     kvrpcpb::{Context, DiskFullOpt, ExtraOp as TxnExtraOp, KeyRange},
-    raft_cmdpb,
+    metapb, raft_cmdpb,
 };
 use pd_client::BucketMeta;
 use raftstore::store::{PessimisticLockPair, TxnExt};
@@ -273,12 +273,20 @@ pub trait Engine: Send + Clone + 'static {
     /// Currently, only multi-rocksdb version will return `None`.
     fn kv_engine(&self) -> Option<Self::Local>;
 
+    fn snapshot_on_kv_engine(&self, _start_key: &[u8], _end_key: &[u8]) -> Result<Self::Snap> {
+        unimplemented!()
+    }
+
     /// Write modifications into internal local engine directly.
     ///
     /// region_modifies records each region's modifications.
     fn modify_on_kv_engine(&self, region_modifies: HashMap<u64, Vec<Modify>>) -> Result<()>;
 
     fn async_snapshot(&self, ctx: SnapContext<'_>, cb: Callback<Self::Snap>) -> Result<()>;
+
+    fn locate_key(&self, _key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
+        unimplemented!()
+    }
 
     /// Precheck request which has write with it's context.
     fn precheck_write_with_ctx(&self, _ctx: &Context) -> Result<()> {

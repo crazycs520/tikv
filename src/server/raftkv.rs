@@ -18,6 +18,7 @@ use engine_traits::{CfName, KvEngine, MvccProperties, Snapshot};
 use kvproto::{
     errorpb,
     kvrpcpb::{Context, IsolationLevel},
+    metapb,
     raft_cmdpb::{CmdType, RaftCmdRequest, RaftCmdResponse, RaftRequestHeader, Request, Response},
 };
 use raft::{
@@ -329,6 +330,18 @@ where
         Some(self.engine.clone())
     }
 
+    fn snapshot_on_kv_engine(&self, start_key: &[u8], end_key: &[u8]) -> kv::Result<Self::Snap> {
+        let mut region = metapb::Region::default();
+        region.set_start_key(start_key.to_owned());
+        region.set_end_key(end_key.to_owned());
+        // Use a fake peer to avoid panic.
+        region.mut_peers().push(Default::default());
+        Ok(RegionSnapshot::<E::Snapshot>::from_raw(
+            self.engine.clone(),
+            region,
+        ))
+    }
+
     fn modify_on_kv_engine(
         &self,
         mut region_modifies: HashMap<u64, Vec<Modify>>,
@@ -481,6 +494,9 @@ where
         })
     }
 
+    fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
+        self.router.locate_key(key)
+    }
     fn release_snapshot(&self) {
         self.router.release_snapshot_cache();
     }

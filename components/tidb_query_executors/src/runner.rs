@@ -149,6 +149,12 @@ impl BatchExecutorsRunner<()> {
                 ExecType::TypePartitionTableScan => {
                     other_err!("PartitionTableScan executor not implemented");
                 }
+                ExecType::TypeSort => {
+                    other_err!("Sort executor not implemented");
+                }
+                ExecType::TypeWindow => {
+                    other_err!("Window executor not implemented");
+                }
             }
         }
 
@@ -662,6 +668,15 @@ impl<SS: 'static> BatchExecutorsRunner<SS> {
         self.exec_stats.clear();
 
         Ok(s_resp)
+    }
+
+    pub fn schema(&self) -> Vec<FieldType> {
+        let schema = self.out_most_executor.schema();
+        let mut res = Vec::new();
+        for off in &self.output_offsets {
+            res.push(schema[*off as usize].clone());
+        }
+        res
     }
 }
 

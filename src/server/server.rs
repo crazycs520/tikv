@@ -92,7 +92,7 @@ impl<T: RaftStoreRouter<E::Local> + Unpin, S: StoreAddrResolver + 'static, E: En
         cfg: &Arc<VersionTrack<Config>>,
         security_mgr: &Arc<SecurityManager>,
         storage: Storage<E, L, F>,
-        copr: Endpoint<E>,
+        copr: Arc<Endpoint<E>>,
         copr_v2: coprocessor_v2::Endpoint,
         raft_router: T,
         resolver: S,
@@ -523,13 +523,13 @@ mod tests {
             &CoprReadPoolConfig::default_for_test(),
             storage.get_engine(),
         ));
-        let copr = coprocessor::Endpoint::new(
+        let copr = Arc::new(coprocessor::Endpoint::new(
             &cfg.value().clone(),
             cop_read_pool.handle(),
             storage.get_concurrency_manager(),
             ResourceTagFactory::new_for_test(),
             Arc::new(QuotaLimiter::default()),
-        );
+        ));
         let copr_v2 = coprocessor_v2::Endpoint::new(&coprocessor_v2::Config::default());
         let debug_thread_pool = Arc::new(
             TokioBuilder::new_multi_thread()
