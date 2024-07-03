@@ -296,9 +296,8 @@ where
         let end = Unbounded::<Vec<u8>>;
         for (_end_key, id) in meta.region_ranges.range((start, end)) {
             if let Some(reader) = meta.readers.get(id) {
-                if reader.leader_lease.is_some()
-                    && util::check_key_in_region(key, &reader.region).is_ok()
-                {
+                let in_lease = reader.is_in_leader_lease(monotonic_raw_now());
+                if in_lease && util::check_key_in_region(key, &reader.region).is_ok() {
                     info!("locate key exist and valid";
                         "key" => ?key,
                         "end_key" => ?_end_key,
@@ -313,7 +312,7 @@ where
                         "end_key" => ?_end_key,
                         "region_start_key" => ?reader.region.start_key,
                         "region_end_key" => ?reader.region.end_key,
-                        "lease" => reader.leader_lease.is_some(),
+                        "in_lease" => in_lease,
                         "contain" => util::check_key_in_region(key, &reader.region).is_ok(),
                         "region_id" => reader.region.id,
                         "term" => reader.term);

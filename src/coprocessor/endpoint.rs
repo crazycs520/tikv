@@ -793,16 +793,20 @@ impl<E: Engine> Endpoint<E> {
 
         async move {
             if result_futures.len() == 0 {
-                // fast return.
+                // this may print many log
                 // info!("no extra task need to do"; "keep_index.len" => keep_index.len());
                 return Ok(resp);
             }
             let mut total_chunks = sel.take_extra_chunks();
             for (i, result) in result_futures {
                 let extra_resp = result.await;
-                info!("get extra req resp"; "data.len" => extra_resp.data.len());
+                // info!("get extra req resp"; "data.len" => extra_resp.data.len());
                 let mut extra_sel = SelectResponse::default();
-                if extra_sel.merge_from_bytes(extra_resp.get_data()).is_ok() {
+                if extra_resp.is_some()
+                    && extra_sel
+                        .merge_from_bytes(extra_resp.unwrap().get_data())
+                        .is_ok()
+                {
                     let extra_chunks = extra_sel.take_chunks().to_vec();
                     for chk in extra_chunks {
                         total_chunks.push(chk);
@@ -862,18 +866,18 @@ impl<E: Engine> Endpoint<E> {
         peer_id: u64,
         term: u64,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+    ) -> impl Future<Output = Option<MemoryTraceGuard<coppb::Response>>> {
         let result_of_future = self
             .parse_extra_requests(req, ranges, peer, region.clone(), peer_id, term, start_ts)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
 
         async move {
             let handle_fut = match result_of_future {
-                Err(e) => return make_error_response(e).into(),
+                Err(e) => return None,
                 Ok(handle_fut) => handle_fut,
             };
             let (mut resp, index_lookup, req_ctx) = match handle_fut.await {
-                Err(e) => return make_error_response(e).into(),
+                Err(e) => return None,
                 Ok(response) => response,
             };
             // print resp value for debug
@@ -940,7 +944,7 @@ impl<E: Engine> Endpoint<E> {
                 }
             }
             info!("handle extra req finish"; "resp.data.len" => resp.data.len(), "extra_schema.len" => extra_schema.len());
-            resp
+            Some(resp)
         }
     }
 
