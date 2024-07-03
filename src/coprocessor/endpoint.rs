@@ -767,19 +767,9 @@ impl<E: Engine> Endpoint<E> {
         }
 
         async move {
-            // let mut schema_types = Vec::new();
             for result in result_futures {
-                let (extra_resp, extra_schema) = result.await;
-                info!("get extra req resp"; "data.len" => extra_resp.data.len(), "schema.len" => extra_schema.len());
-                // if schema_types.is_empty() {
-                //     schema_types = extra_schema
-                //         .iter()
-                //         .map(|ft| {
-                //             FieldTypeTp::from_u8(ft.get_tp() as u8)
-                //                 .unwrap_or(FieldTypeTp::Unspecified)
-                //         })
-                //         .collect();
-                // }
+                let extra_resp = result.await;
+                info!("get extra req resp"; "data.len" => extra_resp.data.len());
                 let mut extra_sel = SelectResponse::default();
                 if extra_sel.merge_from_bytes(extra_resp.get_data()).is_ok() {
                     let extra_chunks = extra_sel.take_chunks().to_vec();
@@ -805,18 +795,18 @@ impl<E: Engine> Endpoint<E> {
         peer_id: u64,
         term: u64,
         start_ts: TimeStamp,
-    ) -> impl Future<Output = (MemoryTraceGuard<coppb::Response>, Vec<FieldType>)> {
+    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
         let result_of_future = self
             .parse_extra_requests(req, ranges, peer, region.clone(), peer_id, term, start_ts)
             .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
 
         async move {
             let handle_fut = match result_of_future {
-                Err(e) => return (make_error_response(e).into(), Vec::new()),
+                Err(e) => return make_error_response(e).into(),
                 Ok(handle_fut) => handle_fut,
             };
             let (mut resp, index_lookup, req_ctx) = match handle_fut.await {
-                Err(e) => return (make_error_response(e).into(), Vec::new()),
+                Err(e) => return make_error_response(e).into(),
                 Ok(response) => response,
             };
             // print resp value for debug
@@ -883,7 +873,7 @@ impl<E: Engine> Endpoint<E> {
                 }
             }
             info!("handle extra req finish"; "resp.data.len" => resp.data.len(), "extra_schema.len" => extra_schema.len());
-            (resp, extra_schema)
+            resp
         }
     }
 
@@ -989,12 +979,6 @@ impl<E: Engine> Endpoint<E> {
         mut table_scan: TableScan,
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<coppb::Response>> {
-        // let check_lock = self.check_memory_locks(&req_ctx);
-        let max_handle_duration = self.max_handle_duration;
-        let perf_level = self.perf_level;
-        let batch_row_limit = self.get_batch_row_limit(false);
-        let quota_limiter = self.quota_limiter.clone();
-
         let result_future = self.handle_extra_requests(
             req.clone(),
             peer.clone(),
