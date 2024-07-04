@@ -875,8 +875,12 @@ impl<E: Engine> Endpoint<E> {
         let mut extra_tasks = Vec::new();
         let mut index_datas = Vec::new();
         let mut keep_index = Vec::new();
+        let mut handle_extra_request_cost: f64 = 0.0;
+        let mut build_extra_cost: f64 = 0.0;
         if sel.merge_from_bytes(resp.get_data()).is_ok() {
+            let begin = std::time::Instant::now();
             let result = self.build_extra_executor_range(&mut sel, schema.clone(), table_scan);
+            build_extra_cost = begin.elapsed().as_secs_f64();
             if result.is_some() {
                 (extra_tasks, index_datas) = result.unwrap();
                 for (i, task) in extra_tasks.iter().enumerate() {
@@ -884,6 +888,7 @@ impl<E: Engine> Endpoint<E> {
                         keep_index.extend_from_slice(&task.index_pointers);
                         continue;
                     }
+                    let begin = std::time::Instant::now();
                     let range_result = self.handle_extra_request(
                         req.clone(),
                         task.ranges.clone(),
@@ -893,6 +898,7 @@ impl<E: Engine> Endpoint<E> {
                         task.term,
                         start_ts,
                     );
+                    handle_extra_request_cost += begin.elapsed().as_secs_f64();
                     result_futures.push((i, range_result));
                 }
             }
@@ -905,8 +911,11 @@ impl<E: Engine> Endpoint<E> {
                 return Ok(resp);
             }
             let mut total_chunks = sel.take_extra_chunks();
+            let mut wait_extra_task_resp_cost: f64 = 0.0;
             for (i, result) in result_futures {
+                let begin = std::time::Instant::now();
                 let extra_resp = result.await;
+                wait_extra_task_resp_cost += begin.elapsed().as_secs_f64();
                 // info!("get extra req resp"; "data.len" => extra_resp.data.len());
                 let mut extra_sel = SelectResponse::default();
                 if extra_resp.is_some()
@@ -922,6 +931,7 @@ impl<E: Engine> Endpoint<E> {
                     keep_index.extend_from_slice(&extra_tasks[i].index_pointers);
                 }
             }
+            info!("handle_extra_requests cost"; "build_extra_cost" => build_extra_cost, "handle_extra_request_cost" => handle_extra_request_cost, "wait_extra_task_resp_cost" => wait_extra_task_resp_cost);
             sel.set_extra_chunks(total_chunks);
             if keep_index.len() == 0 {
                 info!("no need keep index data since all have extra task");
@@ -1105,7 +1115,7 @@ impl<E: Engine> Endpoint<E> {
             None,
             self.perf_level,
         );
-        self.check_memory_locks(&req_ctx)?;
+        // self.check_memory_locks(&req_ctx)?;
         let mut dag = DagRequest::default();
         let data = req.get_data().clone();
         let req_is_cache_enabled = req.get_is_cache_enabled();
