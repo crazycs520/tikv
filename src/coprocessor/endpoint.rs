@@ -972,6 +972,7 @@ impl<E: Engine> Endpoint<E> {
                 sel.write_to_bytes()
                     .expect("write select resp to byte failed"),
             );
+            info!("finish handle extra requests");
             Ok(resp)
         }
     }
@@ -1308,6 +1309,7 @@ impl<E: Engine> Endpoint<E> {
         mut table_scan: TableScan,
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<coppb::Response>> {
+        info!("start to handle extra requests");
         let result_future = self.handle_extra_requests(
             req.clone(),
             peer.clone(),
