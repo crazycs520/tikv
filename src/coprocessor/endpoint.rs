@@ -666,7 +666,6 @@ impl<E: Engine> Endpoint<E> {
             };
 
             let (handle_res, batch_res) = futures::join!(handle_fut, result_of_batch);
-            // let mut res = handle_res.unwrap_or_else(|e| make_error_response(e).into());
             let (mut res, index_lookup, req_ctx) = match handle_res {
                 Err(e) => return make_error_response(e).into(),
                 Ok(response) => response,
@@ -954,7 +953,9 @@ impl<E: Engine> Endpoint<E> {
                         } else {
                             idx_strs.push("".into())
                         }
-                        new_index_columns[col_idx].append_datum(dt).unwrap();
+                        new_index_columns[col_idx]
+                            .append_datum(dt)
+                            .expect("append datum failed");
                     }
                 }
                 info!("some index data have no extra task, need keep"; "keep_index_data"=> ?idx_strs);
@@ -963,11 +964,14 @@ impl<E: Engine> Endpoint<E> {
                     index_chunk
                         .mut_rows_data()
                         .write_chunk_column(&col)
-                        .unwrap();
+                        .expect("write chunk column failed")
                 }
                 sel.set_chunks(vec![index_chunk].into());
             }
-            resp.set_data(sel.write_to_bytes().unwrap());
+            resp.set_data(
+                sel.write_to_bytes()
+                    .expect("write select resp to byte failed"),
+            );
             Ok(resp)
         }
     }
@@ -1191,29 +1195,7 @@ impl<E: Engine> Endpoint<E> {
             table_scan.clone(),
             start_ts,
         );
-        let metadata = TaskMetadata::from_ctx(req_ctx.context.get_resource_control_context());
-        let resource_limiter = self.resource_ctl.as_ref().and_then(|r| {
-            r.get_resource_limiter(
-                req_ctx
-                    .context
-                    .get_resource_control_context()
-                    .get_resource_group_name(),
-                req_ctx.context.get_request_source(),
-                req_ctx
-                    .context
-                    .get_resource_control_context()
-                    .get_override_priority(),
-            )
-        });
-        self.read_pool
-            .spawn_handle(
-                async move { result_future.await },
-                CommandPri::Normal,
-                0,
-                metadata,
-                resource_limiter,
-            )
-            .map(|e| e.unwrap())
+        async move { result_future.await }
     }
 
     // process_batch_tasks process the input batched coprocessor tasks if any,

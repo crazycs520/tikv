@@ -150,11 +150,6 @@ impl RequestHandler for BatchDagHandler {
             .as_ref()
             .map(|index_lookup| (self.runner.schema().to_vec(), index_lookup.clone()))
     }
-
-    fn get_req(&self) -> Option<DagRequest> {
-        self.req.clone()
-    }
-
     fn get_schema(&self) -> Option<Vec<FieldType>> {
         Some(self.runner.schema().to_vec())
     }

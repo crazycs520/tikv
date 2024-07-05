@@ -91,10 +91,6 @@ pub trait RequestHandler: Send {
         None
     }
 
-    fn get_req(&self) -> Option<DagRequest> {
-        None
-    }
-
     fn get_schema(&self) -> Option<Vec<FieldType>> {
         None
     }
