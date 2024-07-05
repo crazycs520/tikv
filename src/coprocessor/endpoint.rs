@@ -888,7 +888,7 @@ impl<E: Engine> Endpoint<E> {
                         continue;
                     }
                     let begin = std::time::Instant::now();
-                    let range_result = self.handle_extra_request(
+                    let range_result = self.handle_extra_request2(
                         req.clone(),
                         task.ranges.clone(),
                         peer.clone(),
@@ -973,6 +973,127 @@ impl<E: Engine> Endpoint<E> {
                     .expect("write select resp to byte failed"),
             );
             Ok(resp)
+        }
+    }
+
+    fn handle_extra_request2(
+        &self,
+        req: coppb::Request,
+        ranges: Vec<coppb::KeyRange>,
+        peer: Option<String>,
+        region: Arc<metapb::Region>,
+        peer_id: u64,
+        term: u64,
+        start_ts: TimeStamp,
+    ) -> impl Future<Output = Option<MemoryTraceGuard<coppb::Response>>> {
+        let mut req = req.clone();
+        req.is_cache_enabled = false;
+        req.set_ranges(ranges.into());
+        let new_context = req.mut_context();
+        new_context.set_region_id(region.id);
+        // new_context.set_region_epoch(region.region_epoch.clone().unwrap());
+        new_context.set_region_epoch(region.get_region_epoch().clone());
+        new_context.set_term(term);
+        new_context.set_replica_read(false);
+        new_context.set_stale_read(false);
+        for p in &region.peers {
+            if p.id == peer_id {
+                new_context.set_peer(p.clone());
+                break;
+            }
+        }
+        let mut dag = DagRequest::default();
+        let data = req.take_data();
+        let req_is_cache_enabled = req.get_is_cache_enabled();
+        let mut input = CodedInputStream::from_bytes(&data);
+        dag.merge_from(&mut input).expect("decode dag failed");
+        let extra_executor = dag.take_extra_executors();
+        let extra_output_offset = dag.take_extra_output_offsets();
+        dag.set_output_offsets(extra_output_offset);
+        dag.set_executors(extra_executor);
+        req.set_data(dag.write_to_bytes().expect("dag write to byte failed"));
+        let request_info = RequestInfo::new(req.get_context(), RequestType::Unknown, req.start_ts);
+        let cur_tracker = GLOBAL_TRACKERS.insert(::tracker::Tracker::new(request_info));
+        set_tls_tracker_token(cur_tracker);
+        let result_of_future = self
+            .parse_request_and_check_memory_locks(req, peer.clone(), false)
+            .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
+
+        async move {
+            let handle_fut = match result_of_future {
+                Err(e) => return None,
+                Ok(handle_fut) => handle_fut,
+            };
+            let (mut resp, index_lookup, req_ctx) = match handle_fut.await {
+                Err(e) => return None,
+                Ok(response) => response,
+            };
+            // print resp value for debug
+            let mut extra_schema = Vec::new();
+            if let Some((schema, _)) = index_lookup {
+                extra_schema = schema.clone();
+                let mut sel = SelectResponse::default();
+                sel.merge_from_bytes(resp.get_data())
+                    .expect("fail to recover SelectResponse");
+                if sel.get_encode_type() == EncodeType::TypeChunk {
+                    let schema_types: Vec<_> = schema
+                        .iter()
+                        .map(|ft| {
+                            FieldTypeTp::from_u8(ft.get_tp() as u8)
+                                .unwrap_or(FieldTypeTp::Unspecified)
+                        })
+                        .collect();
+                    info!("extra req schema"; "schema" => ?schema_types, "schema.len" => schema_types.len());
+                    let mut all_data = Vec::new();
+                    'outer: for chunk in sel.get_chunks() {
+                        let mut data = chunk.get_rows_data();
+                        if data.is_empty() {
+                            continue;
+                        }
+                        let mut columns = Vec::with_capacity(schema.len());
+                        for ft in &schema {
+                            if data.is_empty() {
+                                continue;
+                            }
+                            let col = match Column::decode(
+                                &mut data,
+                                FieldTypeTp::from_u8(ft.get_tp() as u8)
+                                    .unwrap_or(FieldTypeTp::Unspecified),
+                            ) {
+                                Ok(col) => col,
+                                Err(e) => {
+                                    info!("decode chunk error"; "err" => ?e);
+                                    break 'outer;
+                                }
+                            };
+                            columns.push(col);
+                        }
+                        if columns.is_empty() {
+                            continue;
+                        }
+                        let len = columns[0].len();
+
+                        for i in 0..len {
+                            let mut dt = Vec::new();
+                            let mut row = Vec::new();
+                            for (j, ft) in schema.iter().enumerate() {
+                                let v = columns[j].get_datum(i, ft).expect("fail to get datum");
+                                if let Ok(str) = v.to_string() {
+                                    row.push(str);
+                                } else {
+                                    row.push("".to_string());
+                                }
+                                dt.push(v);
+                            }
+                            info!("extra resp"; "row" => ?row, "row.len" => row.len());
+                            all_data.push(dt);
+                        }
+                    }
+                }
+            }
+            info!("handle extra req finish"; "resp.data.len" => resp.data.len(), "extra_schema.len" => extra_schema.len());
+            GLOBAL_TRACKERS.remove(cur_tracker);
+            Some(resp)
         }
     }
 
