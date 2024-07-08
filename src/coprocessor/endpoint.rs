@@ -950,17 +950,23 @@ impl<E: Engine> Endpoint<E> {
                 }
                 let mut idx_strs = Vec::new();
                 for i in keep_index {
-                    let index_row = &index_datas[i];
-                    for (col_idx, dt) in index_row.iter().enumerate() {
-                        if let Ok(str) = dt.to_string() {
-                            idx_strs.push(str)
-                        } else {
-                            idx_strs.push("".into())
+                    match index_datas.get(i) {
+                        Some(index_row) => {
+                            for (col_idx, dt) in index_row.iter().enumerate() {
+                                if let Ok(str) = dt.to_string() {
+                                    idx_strs.push(str)
+                                } else {
+                                    idx_strs.push("".into())
+                                }
+                                new_index_columns[col_idx]
+                                    .append_datum(dt)
+                                    .expect("append datum failed");
+                            }
                         }
-                        new_index_columns[col_idx]
-                            .append_datum(dt)
-                            .expect("append datum failed");
-                    }
+                        _ => {
+                            info!("keep index out range"; "idx" => i, "index_datas.len" => index_datas.len());
+                        }
+                    };
                 }
                 info!("some index data have no extra task, need keep"; "keep_index_data"=> ?idx_strs);
                 let mut index_chunk = Chunk::default();
