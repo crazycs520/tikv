@@ -750,7 +750,9 @@ impl<E: Engine> Endpoint<E> {
 
             let mut table_prefix = vec![];
             table_prefix.extend(TABLE_PREFIX);
-            table_prefix.encode_i64(table_scan.get_table_id()).unwrap();
+            table_prefix
+                .encode_i64(table_scan.get_table_id())
+                .expect("encode i64 succ");
             table_prefix.extend(RECORD_PREFIX_SEP);
 
             if !all_data.is_empty() {
@@ -766,11 +768,11 @@ impl<E: Engine> Endpoint<E> {
                             _ => unreachable!(),
                         };
                         key = table_prefix.clone();
-                        key.encode_i64(idx).unwrap();
+                        key.encode_i64(idx).expect("encode i64 succ");
                     } else {
                         key = table_prefix.clone();
                         key.write_datum(&mut EvalContext::default(), row, true)
-                            .unwrap();
+                            .expect("write datum success");
                     }
                     keys.push((key, row_idx));
                 }
@@ -871,8 +873,8 @@ impl<E: Engine> Endpoint<E> {
     ) -> impl Future<Output = Result<coppb::Response>> {
         let mut sel = SelectResponse::default();
         let mut result_futures = Vec::new();
-        let mut extra_tasks = Vec::new();
-        let mut index_datas = Vec::new();
+        let mut extra_tasks: Vec<ExtraExecutorTask> = Vec::new();
+        let mut index_datas: Vec<Vec<Datum>> = Vec::new();
         let mut keep_index = Vec::new();
         let mut handle_extra_request_cost: f64 = 0.0;
         let mut build_extra_cost: f64 = 0.0;
@@ -880,26 +882,28 @@ impl<E: Engine> Endpoint<E> {
             let begin = std::time::Instant::now();
             let result = self.build_extra_executor_range(&mut sel, schema.clone(), table_scan);
             build_extra_cost = begin.elapsed().as_secs_f64();
-            if result.is_some() {
-                (extra_tasks, index_datas) = result.unwrap();
-                for (i, task) in extra_tasks.iter().enumerate() {
-                    if task.ranges.len() == 0 {
-                        keep_index.extend_from_slice(&task.index_pointers);
-                        continue;
+            match result {
+                Some((extra_tasks, index_datas)) => {
+                    for (i, task) in extra_tasks.iter().enumerate() {
+                        if task.ranges.len() == 0 {
+                            keep_index.extend_from_slice(&task.index_pointers);
+                            continue;
+                        }
+                        let begin = std::time::Instant::now();
+                        let range_result = self.handle_extra_request2(
+                            req.clone(),
+                            task.ranges.clone(),
+                            peer.clone(),
+                            task.region.clone(),
+                            task.peer_id,
+                            task.term,
+                            start_ts,
+                        );
+                        handle_extra_request_cost += begin.elapsed().as_secs_f64();
+                        result_futures.push((i, range_result));
                     }
-                    let begin = std::time::Instant::now();
-                    let range_result = self.handle_extra_request2(
-                        req.clone(),
-                        task.ranges.clone(),
-                        peer.clone(),
-                        task.region.clone(),
-                        task.peer_id,
-                        task.term,
-                        start_ts,
-                    );
-                    handle_extra_request_cost += begin.elapsed().as_secs_f64();
-                    result_futures.push((i, range_result));
                 }
+                _ => {}
             }
         }
 
@@ -917,14 +921,14 @@ impl<E: Engine> Endpoint<E> {
                 wait_extra_task_resp_cost += begin.elapsed().as_secs_f64();
                 // info!("get extra req resp"; "data.len" => extra_resp.data.len());
                 let mut extra_sel = SelectResponse::default();
-                if extra_resp.is_some()
-                    && extra_sel
-                        .merge_from_bytes(extra_resp.unwrap().get_data())
-                        .is_ok()
-                {
-                    let extra_chunks = extra_sel.take_chunks().to_vec();
-                    for chk in extra_chunks {
-                        total_chunks.push(chk);
+                if let Some(extra_resp) = extra_resp {
+                    if extra_sel.merge_from_bytes(extra_resp.get_data()).is_ok() {
+                        let extra_chunks = extra_sel.take_chunks().to_vec();
+                        for chk in extra_chunks {
+                            total_chunks.push(chk);
+                        }
+                    } else {
+                        keep_index.extend_from_slice(&extra_tasks[i].index_pointers);
                     }
                 } else {
                     keep_index.extend_from_slice(&extra_tasks[i].index_pointers);
@@ -992,7 +996,6 @@ impl<E: Engine> Endpoint<E> {
         req.set_ranges(ranges.into());
         let new_context = req.mut_context();
         new_context.set_region_id(region.id);
-        // new_context.set_region_epoch(region.region_epoch.clone().unwrap());
         new_context.set_region_epoch(region.get_region_epoch().clone());
         new_context.set_term(term);
         new_context.set_replica_read(false);
