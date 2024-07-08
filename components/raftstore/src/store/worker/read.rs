@@ -365,7 +365,7 @@ where
 
     // locate_key returns region_id which contains the key.
     fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
-        match self.store_meta.as_ref().lock() {
+        match self.store_meta.lock() {
             Ok(meta) => {
                 let start = Excluded(data_key(key));
                 let end = Unbounded::<Vec<u8>>;
