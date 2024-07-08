@@ -368,7 +368,7 @@ pub trait Engine: Send + Clone + 'static {
     fn async_snapshot(&mut self, ctx: SnapContext<'_>) -> Self::SnapshotRes;
 
     fn locate_key(&self, _key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
-        unimplemented!()
+        None
     }
 
     /// Precheck request which has write with it's context.

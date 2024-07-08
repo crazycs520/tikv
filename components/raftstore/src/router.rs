@@ -130,7 +130,7 @@ where
     fn release_snapshot_cache(&mut self);
 
     fn locate_key(&self, _key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
-        unimplemented!()
+        None
     }
 }
 

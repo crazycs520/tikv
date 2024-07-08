@@ -365,23 +365,24 @@ where
 
     // locate_key returns region_id which contains the key.
     fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
-        let meta = self.store_meta.as_ref().lock().unwrap();
-        let start = Excluded(data_key(key));
-        let end = Unbounded::<Vec<u8>>;
-        for (_end_key, id) in meta.region_ranges.range((start, end)) {
-            if let Some(reader) = meta.readers.get(id) {
-                let in_lease = reader.is_in_leader_lease(monotonic_raw_now());
-                if in_lease && util::check_key_in_region(key, &reader.region).is_ok() {
-                    info!("locate key exist and valid";
+        match self.store_meta.as_ref().lock() {
+            Ok(meta) => {
+                let start = Excluded(data_key(key));
+                let end = Unbounded::<Vec<u8>>;
+                for (_end_key, id) in meta.region_ranges.range((start, end)) {
+                    if let Some(reader) = meta.readers.get(id) {
+                        let in_lease = reader.is_in_leader_lease(monotonic_raw_now());
+                        if in_lease && util::check_key_in_region(key, &reader.region).is_ok() {
+                            info!("locate key exist and valid";
                         "key" => ?key,
                         "end_key" => ?_end_key,
                         "region_start_key" => ?reader.region.start_key,
                         "region_end_key" => ?reader.region.end_key,
                         "region_id" => reader.region.id,
                         "term" => reader.term);
-                    return Some((reader.region.clone(), reader.peer_id, reader.term));
-                } else {
-                    info!("locate key exist, but not valid";
+                            return Some((reader.region.clone(), reader.peer_id, reader.term));
+                        } else {
+                            info!("locate key exist, but not valid";
                         "key" => ?key,
                         "end_key" => ?_end_key,
                         "region_start_key" => ?reader.region.start_key,
@@ -390,12 +391,15 @@ where
                         "contain" => util::check_key_in_region(key, &reader.region).is_ok(),
                         "region_id" => reader.region.id,
                         "term" => reader.term);
+                        }
+                    } else {
+                        info!("locate key not exist"; "key" => ?key);
+                    }
+                    return None;
                 }
-            } else {
-                info!("locate key not exist"; "key" => ?key);
             }
-            return None;
-        }
+            _ => {}
+        };
         return None;
     }
 }
