@@ -644,10 +644,10 @@ impl<E: Engine> Endpoint<E> {
                     term: u64,
                     ranges: &mut Vec<coppb::KeyRange>,
                 ) {
-                    info!("index lookup locate key"; "key" => ?key,
-                                                "region" => region.id,
-                                                "peer" => peer_id,
-                                                "term" => term);
+                    // info!("index lookup locate key"; "key" => ?key,
+                    //                             "region" => region.id,
+                    //                             "peer" => peer_id,
+                    //                             "term" => term);
                     let mut r = coppb::KeyRange::new();
                     r.set_start(key);
                     r.set_end(r.get_start().to_vec());
@@ -689,7 +689,7 @@ impl<E: Engine> Endpoint<E> {
                         add_point_range(raw_key.clone(), region, peer_id, term, &mut ranges);
                         ranges_index_pointers.push(i);
                     } else {
-                        info!("index lookup not locate key"; "key" => ?key);
+                        // info!("index lookup not locate key"; "key" => ?key);
                         keep_indexes.push(i);
                         index_not_located_task.index_pointers.push(i);
                     }
@@ -927,14 +927,17 @@ impl<E: Engine> Endpoint<E> {
                     keep_index.extend_from_slice(&extra_tasks[i].index_pointers);
                 }
             }
-            info!("handle_extra_requests cost"; "handle_extra_request_cost" => handle_extra_request_cost, "wait_extra_task_resp_cost" => wait_extra_task_resp_cost);
+            // info!("handle_extra_requests cost"; "handle_extra_request_cost" =>
+            // handle_extra_request_cost, "wait_extra_task_resp_cost" =>
+            // wait_extra_task_resp_cost);
             sel.set_extra_chunks(total_chunks);
             if keep_index.len() == 0 {
-                info!("no need keep index data since all have extra task");
+                // info!("no need keep index data since all have extra task");
                 sel.clear_chunks();
             } else {
                 keep_index.sort();
-                info!("some index data have no extra task, need keep"; "keep_index_idxs" => ?keep_index);
+                // info!("some index data have no extra task, need keep"; "keep_index_idxs" =>
+                // ?keep_index);
                 let mut new_index_columns = Vec::new();
                 for ft in &schema {
                     let tp =
@@ -957,11 +960,13 @@ impl<E: Engine> Endpoint<E> {
                             }
                         }
                         _ => {
-                            info!("keep index out range"; "idx" => i, "index_datas.len" => index_datas.len());
+                            // info!("keep index out range"; "idx" => i,
+                            // "index_datas.len" => index_datas.len());
                         }
                     };
                 }
-                info!("some index data have no extra task, need keep"; "keep_index_data"=> ?idx_strs);
+                // info!("some index data have no extra task, need keep"; "keep_index_data"=>
+                // ?idx_strs);
                 let mut index_chunk = Chunk::default();
                 for col in new_index_columns {
                     index_chunk
@@ -975,7 +980,7 @@ impl<E: Engine> Endpoint<E> {
                 sel.write_to_bytes()
                     .expect("write select resp to byte failed"),
             );
-            info!("finish handle extra requests");
+            // info!("finish handle extra requests");
             Ok(resp)
         }
     }
@@ -1094,7 +1099,7 @@ impl<E: Engine> Endpoint<E> {
             //         }
             //     }
             // }
-            info!("handle extra req finish"; "resp.data.len" => resp.data.len());
+            // info!("handle extra req finish"; "resp.data.len" => resp.data.len());
             GLOBAL_TRACKERS.remove(cur_tracker);
             Some(resp)
         }
