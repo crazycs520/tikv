@@ -465,8 +465,7 @@ impl<E: Engine> Endpoint<E> {
         handler_builder: RequestHandlerBuilder<E::Snap>,
     ) -> Result<(
         MemoryTraceGuard<coppb::Response>,
-        Option<(Vec<FieldType>, TableScan)>,
-        ReqContext,
+        Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>, Vec<FieldType>)>,
     )> {
         // When this function is being executed, it may be queued for a long time, so
         // that deadline may exceed.
@@ -543,167 +542,24 @@ impl<E: Engine> Endpoint<E> {
         resp.set_exec_details(exec_details);
         resp.set_exec_details_v2(exec_details_v2);
         resp.set_latest_buckets_version(buckets_version);
-        Ok((resp, index_lookup, tracker.req_ctx.clone()))
-    }
 
-    /// Handle a unary request and run on the read pool.
-    ///
-    /// Returns `Err(err)` if the read pool is full. Returns `Ok(future)` in
-    /// other cases. The future inside may be an error however.
-    fn handle_unary_request(
-        &self,
-        req_ctx: ReqContext,
-        handler_builder: RequestHandlerBuilder<E::Snap>,
-    ) -> impl Future<
-        Output = Result<(
-            MemoryTraceGuard<coppb::Response>,
-            Option<(Vec<FieldType>, TableScan)>,
-            ReqContext,
-        )>,
-    > {
-        let priority = req_ctx.context.get_priority();
-        let task_id = req_ctx.build_task_id();
-        let key_ranges: Vec<_> = req_ctx
-            .ranges
-            .iter()
-            .map(|key_range| (key_range.get_start().to_vec(), key_range.get_end().to_vec()))
-            .collect();
-        let resource_tag = self
-            .resource_tag_factory
-            .new_tag_with_key_ranges(&req_ctx.context, key_ranges);
-        let mut allocated_bytes = resource_tag.approximate_heap_size();
-
-        let metadata = TaskMetadata::from_ctx(req_ctx.context.get_resource_control_context());
-        let resource_limiter = self.resource_ctl.as_ref().and_then(|r| {
-            r.get_resource_limiter(
-                req_ctx
-                    .context
-                    .get_resource_control_context()
-                    .get_resource_group_name(),
-                req_ctx.context.get_request_source(),
-                req_ctx
-                    .context
-                    .get_resource_control_context()
-                    .get_override_priority(),
-            )
-        });
-        // box the tracker so that moving it is cheap.
-        let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
-        allocated_bytes += tracker.approximate_mem_size();
-
-        let (tx, rx) = oneshot::channel();
-        let future =
-            Self::handle_unary_request_impl(self.semaphore.clone(), tracker, handler_builder)
-                .in_resource_metering_tag(resource_tag)
-                .map(|res| {
-                    let _ = tx.send(res);
-                });
-        let res = self.read_pool_spawn_with_memory_quota_check(
-            allocated_bytes,
-            future,
-            priority,
-            task_id,
-            metadata,
-            resource_limiter,
-        );
-        async move {
-            res?;
-            rx.map_err(|_| Error::MaxPendingTasksExceeded).await?
-        }
-    }
-
-    /// Parses and handles a unary request. Returns a future that will never
-    /// fail. If there are errors during parsing or handling, they will be
-    /// converted into a `Response` as the success result of the future.
-    #[inline]
-    pub fn parse_and_handle_unary_request(
-        self: &Arc<Self>,
-        mut req: coppb::Request,
-        peer: Option<String>,
-    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
-        let now = Instant::now();
-        // Check the load of the read pool. If it's too busy, generate and return
-        // error in the gRPC thread to avoid waiting in the queue of the read pool.
-        if let Err(busy_err) = self.read_pool.check_busy_threshold(Duration::from_millis(
-            req.get_context().get_busy_threshold_ms() as u64,
-        )) {
-            let mut pb_error = errorpb::Error::new();
-            pb_error.set_server_is_busy(busy_err);
-            let resp = make_error_response(Error::Region(pb_error));
-            return Either::Left(async move { resp.into() });
-        }
-
-        let tracker = GLOBAL_TRACKERS.insert(::tracker::Tracker::new(RequestInfo::new(
-            req.get_context(),
-            RequestType::Unknown,
-            req.start_ts,
-        )));
-        let result_of_batch = self.process_batch_tasks(&mut req, &peer);
-        set_tls_tracker_token(tracker);
-        let start_ts = TimeStamp::new(req.start_ts);
-        let extra_req = req.clone();
-        let result_of_future = self
-            .parse_request_and_check_memory_locks(req, peer.clone(), false)
-            .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
-        with_tls_tracker(|tracker| {
-            tracker.metrics.grpc_process_nanos = now.saturating_elapsed().as_nanos() as u64;
-        });
-
-        let this = self.clone();
-        let fut = async move {
-            defer!({
-                GLOBAL_TRACKERS.remove(tracker);
-            });
-
-            let handle_fut = match result_of_future {
-                Err(e) => {
-                    let mut res = make_error_response(e);
-                    let batch_res = result_of_batch.await;
-                    res.set_batch_responses(batch_res.into());
-                    return res.into();
-                }
-                Ok(handle_fut) => handle_fut,
-            };
-
-            let (handle_res, batch_res) = futures::join!(handle_fut, result_of_batch);
-            let (mut res, index_lookup, req_ctx) = match handle_res {
-                Err(e) => return make_error_response(e).into(),
-                Ok(response) => response,
-            };
-            if let Some((schema, table_info)) = index_lookup {
-                match this
-                    .handle_index_lookup(
-                        extra_req,
-                        req_ctx,
-                        peer,
-                        res.consume(),
-                        schema,
-                        table_info,
-                        start_ts,
-                    )
-                    .await
-                {
-                    Err(e) => return make_error_response(e).into(),
-                    Ok(resp) => res = resp.into(),
-                }
+        // build extra task if needed
+        if let Some((schema, table_scan)) = index_lookup {
+            let mut sel = SelectResponse::default();
+            if sel.merge_from_bytes(resp.get_data()).is_ok() {
+                let extra_task_range =
+                    Self::build_extra_executor_range(&mut sel, schema.clone(), table_scan);
+                return Ok((resp, extra_task_range));
             }
-            res.set_batch_responses(batch_res.into());
-            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                let exec_detail_v2 = res.mut_exec_details_v2();
-                tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
-                tracker.write_time_detail(exec_detail_v2.mut_time_detail_v2());
-            });
-            res
-        };
-        Either::Right(fut)
+        }
+        Ok((resp, None))
     }
 
     fn build_extra_executor_range(
-        &self,
         mut sel: &SelectResponse,
         schema: Vec<FieldType>,
         mut table_scan: TableScan,
-    ) -> Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>)> {
+    ) -> Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>, Vec<FieldType>)> {
         if sel.get_encode_type() == EncodeType::TypeChunk {
             let schema_types: Vec<_> = schema
                 .iter()
@@ -826,11 +682,6 @@ impl<E: Engine> Endpoint<E> {
                         }
                     }
 
-                    // let snapshot = unsafe {
-                    //     with_tls_engine(|engine| Self::async_snapshot(engine, &tracker.req_ctx))
-                    // }
-                    // .await?;
-
                     if let Some((region, peer_id, term)) = unsafe {
                         with_tls_engine(|engine| Self::locate_key(engine, key.as_encoded()))
                     } {
@@ -855,10 +706,161 @@ impl<E: Engine> Endpoint<E> {
                     }
                 }
                 extra_tasks.push(index_not_located_task);
-                return Some((extra_tasks, all_data));
+                return Some((extra_tasks, all_data, schema));
             }
         }
         return None;
+    }
+
+    /// Handle a unary request and run on the read pool.
+    ///
+    /// Returns `Err(err)` if the read pool is full. Returns `Ok(future)` in
+    /// other cases. The future inside may be an error however.
+    fn handle_unary_request(
+        &self,
+        req_ctx: ReqContext,
+        handler_builder: RequestHandlerBuilder<E::Snap>,
+    ) -> impl Future<
+        Output = Result<(
+            MemoryTraceGuard<coppb::Response>,
+            Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>, Vec<FieldType>)>,
+        )>,
+    > {
+        let priority = req_ctx.context.get_priority();
+        let task_id = req_ctx.build_task_id();
+        let key_ranges: Vec<_> = req_ctx
+            .ranges
+            .iter()
+            .map(|key_range| (key_range.get_start().to_vec(), key_range.get_end().to_vec()))
+            .collect();
+        let resource_tag = self
+            .resource_tag_factory
+            .new_tag_with_key_ranges(&req_ctx.context, key_ranges);
+        let mut allocated_bytes = resource_tag.approximate_heap_size();
+
+        let metadata = TaskMetadata::from_ctx(req_ctx.context.get_resource_control_context());
+        let resource_limiter = self.resource_ctl.as_ref().and_then(|r| {
+            r.get_resource_limiter(
+                req_ctx
+                    .context
+                    .get_resource_control_context()
+                    .get_resource_group_name(),
+                req_ctx.context.get_request_source(),
+                req_ctx
+                    .context
+                    .get_resource_control_context()
+                    .get_override_priority(),
+            )
+        });
+        // box the tracker so that moving it is cheap.
+        let tracker = Box::new(Tracker::new(req_ctx, self.slow_log_threshold));
+        allocated_bytes += tracker.approximate_mem_size();
+
+        let (tx, rx) = oneshot::channel();
+        let future =
+            Self::handle_unary_request_impl(self.semaphore.clone(), tracker, handler_builder)
+                .in_resource_metering_tag(resource_tag)
+                .map(|res| {
+                    let _ = tx.send(res);
+                });
+        let res = self.read_pool_spawn_with_memory_quota_check(
+            allocated_bytes,
+            future,
+            priority,
+            task_id,
+            metadata,
+            resource_limiter,
+        );
+        async move {
+            res?;
+            rx.map_err(|_| Error::MaxPendingTasksExceeded).await?
+        }
+    }
+
+    /// Parses and handles a unary request. Returns a future that will never
+    /// fail. If there are errors during parsing or handling, they will be
+    /// converted into a `Response` as the success result of the future.
+    #[inline]
+    pub fn parse_and_handle_unary_request(
+        self: &Arc<Self>,
+        mut req: coppb::Request,
+        peer: Option<String>,
+    ) -> impl Future<Output = MemoryTraceGuard<coppb::Response>> {
+        let now = Instant::now();
+        // Check the load of the read pool. If it's too busy, generate and return
+        // error in the gRPC thread to avoid waiting in the queue of the read pool.
+        if let Err(busy_err) = self.read_pool.check_busy_threshold(Duration::from_millis(
+            req.get_context().get_busy_threshold_ms() as u64,
+        )) {
+            let mut pb_error = errorpb::Error::new();
+            pb_error.set_server_is_busy(busy_err);
+            let resp = make_error_response(Error::Region(pb_error));
+            return Either::Left(async move { resp.into() });
+        }
+
+        let tracker = GLOBAL_TRACKERS.insert(::tracker::Tracker::new(RequestInfo::new(
+            req.get_context(),
+            RequestType::Unknown,
+            req.start_ts,
+        )));
+        let result_of_batch = self.process_batch_tasks(&mut req, &peer);
+        set_tls_tracker_token(tracker);
+        let start_ts = TimeStamp::new(req.start_ts);
+        let extra_req = req.clone();
+        let result_of_future = self
+            .parse_request_and_check_memory_locks(req, peer.clone(), false)
+            .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
+        with_tls_tracker(|tracker| {
+            tracker.metrics.grpc_process_nanos = now.saturating_elapsed().as_nanos() as u64;
+        });
+
+        let this = self.clone();
+        let fut = async move {
+            defer!({
+                GLOBAL_TRACKERS.remove(tracker);
+            });
+
+            let handle_fut = match result_of_future {
+                Err(e) => {
+                    let mut res = make_error_response(e);
+                    let batch_res = result_of_batch.await;
+                    res.set_batch_responses(batch_res.into());
+                    return res.into();
+                }
+                Ok(handle_fut) => handle_fut,
+            };
+
+            let (handle_res, batch_res) = futures::join!(handle_fut, result_of_batch);
+            let (mut res, extra_tasks) = match handle_res {
+                Err(e) => return make_error_response(e).into(),
+                Ok(response) => response,
+            };
+            if let Some((extra_tasks, index_data, schema)) = extra_tasks {
+                match this
+                    .handle_extra_requests(
+                        extra_req,
+                        peer,
+                        res.consume(),
+                        extra_tasks,
+                        index_data,
+                        schema,
+                        start_ts,
+                    )
+                    .await
+                {
+                    Err(e) => return make_error_response(e).into(),
+                    Ok(resp) => res = resp.into(),
+                }
+            }
+            res.set_batch_responses(batch_res.into());
+            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                let exec_detail_v2 = res.mut_exec_details_v2();
+                tracker.write_scan_detail(exec_detail_v2.mut_scan_detail_v2());
+                tracker.write_time_detail(exec_detail_v2.mut_time_detail_v2());
+            });
+            res
+        };
+        Either::Right(fut)
     }
 
     #[inline]
@@ -867,43 +869,34 @@ impl<E: Engine> Endpoint<E> {
         req: coppb::Request,
         peer: Option<String>,
         mut resp: coppb::Response,
+        extra_tasks: Vec<ExtraExecutorTask>,
+        index_datas: Vec<Vec<Datum>>,
         schema: Vec<FieldType>,
-        table_scan: TableScan,
         start_ts: TimeStamp,
     ) -> impl Future<Output = Result<coppb::Response>> {
         let mut sel = SelectResponse::default();
         let mut result_futures = Vec::new();
-        let mut extra_tasks: Vec<ExtraExecutorTask> = Vec::new();
-        let mut index_datas: Vec<Vec<Datum>> = Vec::new();
         let mut keep_index = Vec::new();
         let mut handle_extra_request_cost: f64 = 0.0;
-        let mut build_extra_cost: f64 = 0.0;
         if sel.merge_from_bytes(resp.get_data()).is_ok() {
             let begin = std::time::Instant::now();
-            let result = self.build_extra_executor_range(&mut sel, schema.clone(), table_scan);
-            build_extra_cost = begin.elapsed().as_secs_f64();
-            match result {
-                Some((extra_tasks, index_datas)) => {
-                    for (i, task) in extra_tasks.iter().enumerate() {
-                        if task.ranges.len() == 0 {
-                            keep_index.extend_from_slice(&task.index_pointers);
-                            continue;
-                        }
-                        let begin = std::time::Instant::now();
-                        let range_result = self.handle_extra_request2(
-                            req.clone(),
-                            task.ranges.clone(),
-                            peer.clone(),
-                            task.region.clone(),
-                            task.peer_id,
-                            task.term,
-                            start_ts,
-                        );
-                        handle_extra_request_cost += begin.elapsed().as_secs_f64();
-                        result_futures.push((i, range_result));
-                    }
+            for (i, task) in extra_tasks.iter().enumerate() {
+                if task.ranges.len() == 0 {
+                    keep_index.extend_from_slice(&task.index_pointers);
+                    continue;
                 }
-                _ => {}
+                let begin = std::time::Instant::now();
+                let range_result = self.handle_extra_request(
+                    req.clone(),
+                    task.ranges.clone(),
+                    peer.clone(),
+                    task.region.clone(),
+                    task.peer_id,
+                    task.term,
+                    start_ts,
+                );
+                handle_extra_request_cost += begin.elapsed().as_secs_f64();
+                result_futures.push((i, range_result));
             }
         }
 
@@ -934,7 +927,7 @@ impl<E: Engine> Endpoint<E> {
                     keep_index.extend_from_slice(&extra_tasks[i].index_pointers);
                 }
             }
-            info!("handle_extra_requests cost"; "build_extra_cost" => build_extra_cost, "handle_extra_request_cost" => handle_extra_request_cost, "wait_extra_task_resp_cost" => wait_extra_task_resp_cost);
+            info!("handle_extra_requests cost"; "handle_extra_request_cost" => handle_extra_request_cost, "wait_extra_task_resp_cost" => wait_extra_task_resp_cost);
             sel.set_extra_chunks(total_chunks);
             if keep_index.len() == 0 {
                 info!("no need keep index data since all have extra task");
@@ -987,7 +980,7 @@ impl<E: Engine> Endpoint<E> {
         }
     }
 
-    fn handle_extra_request2(
+    fn handle_extra_request(
         &self,
         req: coppb::Request,
         ranges: Vec<coppb::KeyRange>,
@@ -1034,300 +1027,77 @@ impl<E: Engine> Endpoint<E> {
                 Err(e) => return None,
                 Ok(handle_fut) => handle_fut,
             };
-            let (mut resp, index_lookup, req_ctx) = match handle_fut.await {
+            let (mut resp, extra_task) = match handle_fut.await {
                 Err(e) => return None,
                 Ok(response) => response,
             };
             // print resp value for debug
-            let mut extra_schema = Vec::new();
-            if let Some((schema, _)) = index_lookup {
-                extra_schema = schema.clone();
-                let mut sel = SelectResponse::default();
-                sel.merge_from_bytes(resp.get_data())
-                    .expect("fail to recover SelectResponse");
-                if sel.get_encode_type() == EncodeType::TypeChunk {
-                    let schema_types: Vec<_> = schema
-                        .iter()
-                        .map(|ft| {
-                            FieldTypeTp::from_u8(ft.get_tp() as u8)
-                                .unwrap_or(FieldTypeTp::Unspecified)
-                        })
-                        .collect();
-                    info!("extra req schema"; "schema" => ?schema_types, "schema.len" => schema_types.len());
-                    let mut all_data = Vec::new();
-                    'outer: for chunk in sel.get_chunks() {
-                        let mut data = chunk.get_rows_data();
-                        if data.is_empty() {
-                            continue;
-                        }
-                        let mut columns = Vec::with_capacity(schema.len());
-                        for ft in &schema {
-                            if data.is_empty() {
-                                continue;
-                            }
-                            let col = match Column::decode(
-                                &mut data,
-                                FieldTypeTp::from_u8(ft.get_tp() as u8)
-                                    .unwrap_or(FieldTypeTp::Unspecified),
-                            ) {
-                                Ok(col) => col,
-                                Err(e) => {
-                                    info!("decode chunk error"; "err" => ?e);
-                                    break 'outer;
-                                }
-                            };
-                            columns.push(col);
-                        }
-                        if columns.is_empty() {
-                            continue;
-                        }
-                        let len = columns[0].len();
-
-                        for i in 0..len {
-                            let mut dt = Vec::new();
-                            let mut row = Vec::new();
-                            for (j, ft) in schema.iter().enumerate() {
-                                let v = columns[j].get_datum(i, ft).expect("fail to get datum");
-                                if let Ok(str) = v.to_string() {
-                                    row.push(str);
-                                } else {
-                                    row.push("".to_string());
-                                }
-                                dt.push(v);
-                            }
-                            info!("extra resp"; "row" => ?row, "row.len" => row.len());
-                            all_data.push(dt);
-                        }
-                    }
-                }
-            }
-            info!("handle extra req finish"; "resp.data.len" => resp.data.len(), "extra_schema.len" => extra_schema.len());
+            // let mut extra_schema = Vec::new();
+            // if let Some((schema, _)) = index_lookup {
+            //     extra_schema = schema.clone();
+            //     let mut sel = SelectResponse::default();
+            //     sel.merge_from_bytes(resp.get_data())
+            //         .expect("fail to recover SelectResponse");
+            //     if sel.get_encode_type() == EncodeType::TypeChunk {
+            //         let schema_types: Vec<_> = schema
+            //             .iter()
+            //             .map(|ft| {
+            //                 FieldTypeTp::from_u8(ft.get_tp() as u8)
+            //                     .unwrap_or(FieldTypeTp::Unspecified)
+            //             })
+            //             .collect();
+            //         info!("extra req schema"; "schema" => ?schema_types, "schema.len" =>
+            // schema_types.len());         let mut all_data = Vec::new();
+            //         'outer: for chunk in sel.get_chunks() {
+            //             let mut data = chunk.get_rows_data();
+            //             if data.is_empty() {
+            //                 continue;
+            //             }
+            //             let mut columns = Vec::with_capacity(schema.len());
+            //             for ft in &schema {
+            //                 if data.is_empty() {
+            //                     continue;
+            //                 }
+            //                 let col = match Column::decode(
+            //                     &mut data,
+            //                     FieldTypeTp::from_u8(ft.get_tp() as u8)
+            //                         .unwrap_or(FieldTypeTp::Unspecified),
+            //                 ) {
+            //                     Ok(col) => col,
+            //                     Err(e) => {
+            //                         info!("decode chunk error"; "err" => ?e);
+            //                         break 'outer;
+            //                     }
+            //                 };
+            //                 columns.push(col);
+            //             }
+            //             if columns.is_empty() {
+            //                 continue;
+            //             }
+            //             let len = columns[0].len();
+            //
+            //             for i in 0..len {
+            //                 let mut dt = Vec::new();
+            //                 let mut row = Vec::new();
+            //                 for (j, ft) in schema.iter().enumerate() {
+            //                     let v = columns[j].get_datum(i, ft).expect("fail to get
+            // datum");                     if let Ok(str) = v.to_string() {
+            //                         row.push(str);
+            //                     } else {
+            //                         row.push("".to_string());
+            //                     }
+            //                     dt.push(v);
+            //                 }
+            //                 info!("extra resp"; "row" => ?row, "row.len" => row.len());
+            //                 all_data.push(dt);
+            //             }
+            //         }
+            //     }
+            // }
+            info!("handle extra req finish"; "resp.data.len" => resp.data.len());
             GLOBAL_TRACKERS.remove(cur_tracker);
             Some(resp)
         }
-    }
-
-    fn handle_extra_request(
-        &self,
-        req: coppb::Request,
-        ranges: Vec<coppb::KeyRange>,
-        peer: Option<String>,
-        region: Arc<metapb::Region>,
-        peer_id: u64,
-        term: u64,
-        start_ts: TimeStamp,
-    ) -> impl Future<Output = Option<MemoryTraceGuard<coppb::Response>>> {
-        let result_of_future = self
-            .parse_extra_requests(req, ranges, peer, region.clone(), peer_id, term, start_ts)
-            .map(|(handler_builder, req_ctx)| self.handle_unary_request(req_ctx, handler_builder));
-
-        async move {
-            let handle_fut = match result_of_future {
-                Err(e) => return None,
-                Ok(handle_fut) => handle_fut,
-            };
-            let (mut resp, index_lookup, req_ctx) = match handle_fut.await {
-                Err(e) => return None,
-                Ok(response) => response,
-            };
-            // print resp value for debug
-            let mut extra_schema = Vec::new();
-            if let Some((schema, _)) = index_lookup {
-                extra_schema = schema.clone();
-                let mut sel = SelectResponse::default();
-                sel.merge_from_bytes(resp.get_data())
-                    .expect("fail to recover SelectResponse");
-                if sel.get_encode_type() == EncodeType::TypeChunk {
-                    let schema_types: Vec<_> = schema
-                        .iter()
-                        .map(|ft| {
-                            FieldTypeTp::from_u8(ft.get_tp() as u8)
-                                .unwrap_or(FieldTypeTp::Unspecified)
-                        })
-                        .collect();
-                    info!("extra req schema"; "schema" => ?schema_types, "schema.len" => schema_types.len());
-                    let mut all_data = Vec::new();
-                    'outer: for chunk in sel.get_chunks() {
-                        let mut data = chunk.get_rows_data();
-                        if data.is_empty() {
-                            continue;
-                        }
-                        let mut columns = Vec::with_capacity(schema.len());
-                        for ft in &schema {
-                            if data.is_empty() {
-                                continue;
-                            }
-                            let col = match Column::decode(
-                                &mut data,
-                                FieldTypeTp::from_u8(ft.get_tp() as u8)
-                                    .unwrap_or(FieldTypeTp::Unspecified),
-                            ) {
-                                Ok(col) => col,
-                                Err(e) => {
-                                    info!("decode chunk error"; "err" => ?e);
-                                    break 'outer;
-                                }
-                            };
-                            columns.push(col);
-                        }
-                        if columns.is_empty() {
-                            continue;
-                        }
-                        let len = columns[0].len();
-
-                        for i in 0..len {
-                            let mut dt = Vec::new();
-                            let mut row = Vec::new();
-                            for (j, ft) in schema.iter().enumerate() {
-                                let v = columns[j].get_datum(i, ft).expect("fail to get datum");
-                                if let Ok(str) = v.to_string() {
-                                    row.push(str);
-                                } else {
-                                    row.push("".to_string());
-                                }
-                                dt.push(v);
-                            }
-                            info!("extra resp"; "row" => ?row, "row.len" => row.len());
-                            all_data.push(dt);
-                        }
-                    }
-                }
-            }
-            info!("handle extra req finish"; "resp.data.len" => resp.data.len(), "extra_schema.len" => extra_schema.len());
-            Some(resp)
-        }
-    }
-
-    fn parse_extra_requests(
-        &self,
-        req: coppb::Request,
-        ranges: Vec<coppb::KeyRange>,
-        peer: Option<String>,
-        region: Arc<metapb::Region>,
-        peer_id: u64,
-        term: u64,
-        start_ts: TimeStamp,
-    ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
-        dispatch_api_version!(req.get_context().get_api_version(), {
-            self.parse_extra_requests_impl::<API>(
-                req, ranges, peer, region, peer_id, term, start_ts,
-            )
-        })
-    }
-
-    fn parse_extra_requests_impl<F: KvFormat>(
-        &self,
-        req: coppb::Request,
-        ranges: Vec<coppb::KeyRange>,
-        peer: Option<String>,
-        region: Arc<metapb::Region>,
-        peer_id: u64,
-        term: u64,
-        start_ts: TimeStamp,
-    ) -> Result<(RequestHandlerBuilder<E::Snap>, ReqContext)> {
-        // build extra executor and exec.
-        let mut context = req.get_context().clone();
-        context.set_region_id(region.id);
-        context.set_region_epoch(region.region_epoch.clone().unwrap());
-        context.set_term(term);
-        context.set_replica_read(false);
-        context.set_stale_read(false);
-        for p in &region.peers {
-            if p.id == peer_id {
-                context.set_peer(p.clone());
-                break;
-            }
-        }
-
-        let req_ctx = ReqContext::new(
-            ReqTag::select,
-            context,
-            ranges,
-            self.max_handle_duration,
-            peer.clone(),
-            Some(false),
-            start_ts.into(),
-            None,
-            self.perf_level,
-        );
-        // self.check_memory_locks(&req_ctx)?;
-        let mut dag = DagRequest::default();
-        let data = req.get_data().clone();
-        let req_is_cache_enabled = req.get_is_cache_enabled();
-        let mut input = CodedInputStream::from_bytes(data);
-        box_try!(dag.merge_from(&mut input));
-        let extra_executor = dag.take_extra_executors();
-        let extra_output_offset = dag.take_extra_output_offsets();
-        dag.set_output_offsets(extra_output_offset);
-        dag.set_executors(extra_executor);
-        let extra_executor = dag.get_executors();
-        // if extra_executor.len() > 0 {
-        //     info!("index lookup build extra executor";
-        //     "ranges" => ?req_ctx.ranges,
-        //     "region" => region.id,
-        //     "peer" => peer_id,
-        //     "term" => term,
-        //     "extra_executor.len" => extra_executor.len(),
-        //     "extra_executor_id" => extra_executor[0].get_executor_id(),
-        //     "extra_executor_tp" => ?extra_executor[0].get_tp(),
-        //     "extra_executor0_cols" =>
-        // extra_executor[0].get_tbl_scan().get_columns().len(),     "dag" =>
-        // ?dag); }
-        let batch_row_limit = self.get_batch_row_limit(false);
-        let quota_limiter = self.quota_limiter.clone();
-        let handler_builder: RequestHandlerBuilder<E::Snap> = Box::new(move |snap, req_ctx| {
-            let data_version = snap.ext().get_data_version();
-            let store = SnapshotStore::new(
-                snap,
-                start_ts.into(),
-                req_ctx.context.get_isolation_level(),
-                !req_ctx.context.get_not_fill_cache(),
-                req_ctx.bypass_locks.clone(),
-                req_ctx.access_locks.clone(),
-                req_is_cache_enabled,
-            );
-            let handler = dag::DagHandlerBuilder::<_, F>::new(
-                dag,
-                req_ctx.ranges.clone(),
-                store,
-                req_ctx.deadline,
-                batch_row_limit,
-                false,
-                req_is_cache_enabled,
-                None,
-                quota_limiter,
-            )
-            .data_version(data_version)
-            .build();
-
-            // if let Ok(e) = &handler {
-            //     info!("index lookup build extra executor 2"; "handler_schema" =>
-            // ?e.get_schema()); }
-            handler
-        });
-        Ok((handler_builder, req_ctx))
-    }
-
-    fn handle_index_lookup(
-        &self,
-        req: coppb::Request,
-        req_ctx: ReqContext,
-        peer: Option<String>,
-        mut resp: coppb::Response,
-        schema: Vec<FieldType>,
-        mut table_scan: TableScan,
-        start_ts: TimeStamp,
-    ) -> impl Future<Output = Result<coppb::Response>> {
-        info!("start to handle extra requests");
-        let result_future = self.handle_extra_requests(
-            req.clone(),
-            peer.clone(),
-            resp.clone(),
-            schema.clone(),
-            table_scan.clone(),
-            start_ts,
-        );
-        async move { result_future.await }
     }
 
     // process_batch_tasks process the input batched coprocessor tasks if any,
