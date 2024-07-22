@@ -87,8 +87,7 @@ impl<S: Store + 'static, F: KvFormat> DagHandlerBuilder<S, F> {
 pub struct BatchDagHandler {
     runner: tidb_query_executors::runner::BatchExecutorsRunner<Statistics>,
     data_version: Option<u64>,
-    index_lookup: Option<TableScan>,
-    req: Option<DagRequest>,
+    extra_table_id: Option<i64>,
 }
 
 impl BatchDagHandler {
@@ -104,10 +103,7 @@ impl BatchDagHandler {
         paging_size: Option<u64>,
         quota_limiter: Arc<QuotaLimiter>,
     ) -> Result<Self> {
-        let extra_dag = req.has_extra_table_info().then(|| req.clone());
-        let index_lookup = req
-            .has_extra_table_info()
-            .then(|| req.take_extra_table_info());
+        let extra_table_id = req.has_extra_table_id().then(|| req.get_extra_table_id());
         Ok(Self {
             runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request::<_, F>(
                 req,
@@ -120,8 +116,7 @@ impl BatchDagHandler {
                 quota_limiter,
             )?,
             data_version,
-            req: extra_dag,
-            index_lookup,
+            extra_table_id,
         })
     }
 }
@@ -145,10 +140,9 @@ impl RequestHandler for BatchDagHandler {
         self.runner.collect_scan_summary(dest);
     }
 
-    fn index_lookup(&self) -> Option<(Vec<FieldType>, TableScan)> {
-        self.index_lookup
-            .as_ref()
-            .map(|index_lookup| (self.runner.schema().to_vec(), index_lookup.clone()))
+    fn index_lookup(&self) -> Option<(Vec<FieldType>, i64)> {
+        self.extra_table_id
+            .map(|extra_table_id| (self.runner.schema().to_vec(), extra_table_id))
     }
     fn get_schema(&self) -> Option<Vec<FieldType>> {
         Some(self.runner.schema().to_vec())

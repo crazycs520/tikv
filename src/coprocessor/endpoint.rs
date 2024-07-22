@@ -544,11 +544,11 @@ impl<E: Engine> Endpoint<E> {
         resp.set_latest_buckets_version(buckets_version);
 
         // build extra task if needed
-        if let Some((schema, table_scan)) = index_lookup {
+        if let Some((schema, extra_table_id)) = index_lookup {
             let mut sel = SelectResponse::default();
             if sel.merge_from_bytes(resp.get_data()).is_ok() {
                 let extra_task_range =
-                    Self::build_extra_executor_range(&mut sel, schema.clone(), table_scan);
+                    Self::build_extra_executor_range(&mut sel, schema.clone(), extra_table_id);
                 return Ok((resp, extra_task_range));
             }
         }
@@ -558,7 +558,7 @@ impl<E: Engine> Endpoint<E> {
     fn build_extra_executor_range(
         mut sel: &SelectResponse,
         schema: Vec<FieldType>,
-        mut table_scan: TableScan,
+        table_id: i64,
     ) -> Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>, Vec<FieldType>)> {
         if sel.get_encode_type() == EncodeType::TypeChunk {
             let schema_types: Vec<_> = schema
@@ -606,9 +606,7 @@ impl<E: Engine> Endpoint<E> {
 
             let mut table_prefix = vec![];
             table_prefix.extend(TABLE_PREFIX);
-            table_prefix
-                .encode_i64(table_scan.get_table_id())
-                .expect("encode i64 succ");
+            table_prefix.encode_i64(table_id).expect("encode i64 succ");
             table_prefix.extend(RECORD_PREFIX_SEP);
 
             if !all_data.is_empty() {

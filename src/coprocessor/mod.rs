@@ -87,7 +87,7 @@ pub trait RequestHandler: Send {
         // Do nothing by default
     }
 
-    fn index_lookup(&self) -> Option<(Vec<FieldType>, TableScan)> {
+    fn index_lookup(&self) -> Option<(Vec<FieldType>, i64)> {
         None
     }
 
