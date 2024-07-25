@@ -611,24 +611,20 @@ impl<E: Engine> Endpoint<E> {
 
             if !all_data.is_empty() {
                 let mut keys = Vec::with_capacity(all_data.len());
-                for (row_idx, row) in all_data.iter().enumerate() {
-                    let mut key;
-                    if schema_types.len() == 1
-                        && matches!(schema_types[0], FieldTypeTp::Long | FieldTypeTp::LongLong)
-                    {
-                        let idx = match row[0] {
+                if schema_types.len() == 1
+                    && matches!(schema_types[0], FieldTypeTp::Long | FieldTypeTp::LongLong)
+                {
+                    for (row_idx, row) in all_data.iter().enumerate() {
+                        let mut key;
+                        let handle = match row[0] {
                             Datum::I64(x) => x,
                             Datum::U64(x) => x as i64,
                             _ => unreachable!(),
                         };
                         key = table_prefix.clone();
-                        key.encode_i64(idx).expect("encode i64 succ");
-                    } else {
-                        key = table_prefix.clone();
-                        key.write_datum(&mut EvalContext::default(), row, true)
-                            .expect("write datum success");
+                        key.encode_i64(handle).expect("encode i64 succ");
+                        keys.push((key, handle, row_idx));
                     }
-                    keys.push((key, row_idx));
                 }
                 keys.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut ranges: Vec<coppb::KeyRange> = Vec::new();
@@ -652,20 +648,34 @@ impl<E: Engine> Endpoint<E> {
                     convert_to_prefix_next(r.mut_end());
                     ranges.push(r);
                 }
+                fn append_last_range(mut key: Vec<u8>, ranges: &mut Vec<coppb::KeyRange>) {
+                    convert_to_prefix_next(&mut key);
+                    let last_idx = ranges.len() - 1;
+                    ranges.get_mut(last_idx).unwrap().set_end(key);
+                }
                 let mut index_not_located_task = ExtraExecutorTask::default();
                 let mut ranges_index_pointers = Vec::new();
-                for (raw_key, i) in keys {
+                let mut last_handle = None;
+                for (raw_key, handle, i) in keys {
                     let key = Key::from_raw(&raw_key);
                     if let Some((region, peer_id, term)) = &last_region {
                         if util::check_key_in_region(key.as_encoded(), &region).is_ok() {
                             ranges_index_pointers.push(i);
-                            add_point_range(
-                                raw_key.clone(),
-                                region.clone(),
-                                *peer_id,
-                                *term,
-                                &mut ranges,
-                            );
+                            match last_handle {
+                                Some(last) if last == handle - 1 => {
+                                    append_last_range(raw_key.clone(), &mut ranges);
+                                }
+                                _ => {
+                                    add_point_range(
+                                        raw_key.clone(),
+                                        region.clone(),
+                                        *peer_id,
+                                        *term,
+                                        &mut ranges,
+                                    );
+                                }
+                            };
+                            last_handle = Some(handle);
                             continue;
                         } else {
                             extra_tasks.push(ExtraExecutorTask {
@@ -685,6 +695,7 @@ impl<E: Engine> Endpoint<E> {
                     } {
                         last_region = Some((region.clone(), peer_id, term));
                         add_point_range(raw_key.clone(), region, peer_id, term, &mut ranges);
+                        last_handle = Some(handle);
                         ranges_index_pointers.push(i);
                     } else {
                         // info!("index lookup not locate key"; "key" => ?key);
