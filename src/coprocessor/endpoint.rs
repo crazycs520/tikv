@@ -994,7 +994,6 @@ impl<E: Engine> Endpoint<E> {
         start_ts: TimeStamp,
     ) -> impl Future<Output = Option<MemoryTraceGuard<coppb::Response>>> {
         let mut req = req.clone();
-        req.is_cache_enabled = false;
         req.set_ranges(ranges.into());
         let new_context = req.mut_context();
         new_context.set_region_id(region.id);
@@ -1010,7 +1009,6 @@ impl<E: Engine> Endpoint<E> {
         }
         let mut dag = DagRequest::default();
         let data = req.take_data();
-        let req_is_cache_enabled = req.get_is_cache_enabled();
         let mut input = CodedInputStream::from_bytes(&data);
         dag.merge_from(&mut input).expect("decode dag failed");
         let extra_executor = dag.take_extra_executors();
