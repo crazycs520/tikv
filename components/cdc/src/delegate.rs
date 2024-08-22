@@ -7,7 +7,7 @@ use std::{
     result::Result as StdResult,
     string::String,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -142,6 +142,7 @@ pub struct Downstream {
 
     sink: Option<Sink>,
     state: Arc<AtomicCell<DownstreamState>>,
+    pub(crate) scan_truncated: Arc<AtomicBool>,
 
     // Fields to handle ResolvedTs advancing. If `lock_heap` is none it means
     // the downstream hasn't finished the incremental scanning.
@@ -186,13 +187,16 @@ impl Downstream {
 
             sink: None,
             state: Arc::new(AtomicCell::new(DownstreamState::default())),
+            scan_truncated: Arc::new(AtomicBool::new(false)),
 
             lock_heap: None,
             advanced_to: TimeStamp::zero(),
         }
     }
 
-    /// Sink events to the downstream.
+    // NOTE: it's not allowed to sink `EventError` directly by this function,
+    // because the sink can be also used by an incremental scan. We must ensure
+    // no more events can be pushed to the sink after an `EventError` is sent.
     pub fn sink_event(&self, mut event: Event, force: bool) -> Result<()> {
         event.set_request_id(self.req_id.0);
         if self.sink.is_none() {
@@ -217,25 +221,20 @@ impl Downstream {
         }
     }
 
+    /// EventErrors must be sent by this function. And we must ensure no more
+    /// events or ResolvedTs will be sent to the downstream after
+    /// `sink_error_event` is called.
     pub fn sink_error_event(&self, region_id: u64, err_event: EventError) -> Result<()> {
+        info!("cdc downstream meets region error";
+            "conn_id" => ?self.conn_id, "downstream_id" => ?self.id, "req_id" => ?self.req_id);
+
+        self.scan_truncated.store(true, Ordering::Release);
         let mut change_data_event = Event::default();
         change_data_event.event = Some(Event_oneof_event::Error(err_event));
         change_data_event.region_id = region_id;
         // Try it's best to send error events.
         let force_send = true;
         self.sink_event(change_data_event, force_send)
-    }
-
-    pub fn sink_region_not_found(&self, region_id: u64) -> Result<()> {
-        let mut err_event = EventError::default();
-        err_event.mut_region_not_found().region_id = region_id;
-        self.sink_error_event(region_id, err_event)
-    }
-
-    pub fn sink_server_is_busy(&self, region_id: u64, reason: String) -> Result<()> {
-        let mut err_event = EventError::default();
-        err_event.mut_server_is_busy().reason = reason;
-        self.sink_error_event(region_id, err_event)
     }
 
     pub fn set_sink(&mut self, sink: Sink) {
@@ -669,14 +668,14 @@ impl Delegate {
                 let k = (d.conn_id, d.req_id);
                 let v = advance.multiplexing.entry(k).or_default();
                 v.push(self.region_id, advanced_to);
-            } else {
+            } else if features.contains(FeatureGate::BATCH_RESOLVED_TS) {
                 let v = advance.exclusive.entry(d.conn_id).or_default();
                 v.push(self.region_id, advanced_to);
-                if !features.contains(FeatureGate::BATCH_RESOLVED_TS) {
-                    let k = (d.conn_id, self.region_id);
-                    advance.dispersed.insert(k, d.req_id.0);
-                }
-            };
+            } else {
+                let k = (d.conn_id, self.region_id);
+                let v = (d.req_id, advanced_to);
+                advance.compat.insert(k, v);
+            }
 
             let lag = current_ts
                 .physical()
@@ -770,7 +769,7 @@ impl Delegate {
                     }
                     decode_default(default.1, &mut row, &mut _has_value);
                     row.old_value = old_value.finalized().unwrap_or_default();
-                    row_size = row.key.len() + row.value.len();
+                    row_size = row.key.len() + row.value.len() + row.old_value.len();
                 }
                 Some(KvEntry::TxnEntry(TxnEntry::Commit {
                     default,
@@ -798,7 +797,7 @@ impl Delegate {
                     }
                     set_event_row_type(&mut row, EventLogType::Committed);
                     row.old_value = old_value.finalized().unwrap_or_default();
-                    row_size = row.key.len() + row.value.len();
+                    row_size = row.key.len() + row.value.len() + row.old_value.len();
                 }
                 None => {
                     // This type means scan has finished.
@@ -912,7 +911,7 @@ impl Delegate {
         Ok(())
     }
 
-    fn sink_downstream_tidb(&mut self, mut entries: Vec<(EventRow, isize)>) -> Result<()> {
+    fn sink_downstream_tidb(&mut self, entries: Vec<(EventRow, isize)>) -> Result<()> {
         let mut downstreams = Vec::with_capacity(self.downstreams.len());
         for d in &mut self.downstreams {
             if d.kv_api == ChangeDataRequestKvApi::TiDb && d.state.load().ready_for_change_events()
@@ -924,12 +923,13 @@ impl Delegate {
             return Ok(());
         }
 
-        // Drop lossy DDL entries.
-        entries.retain(|(x, _)| !TxnSource::is_lossy_ddl_reorg_source_set(x.txn_source));
-
         for downstream in downstreams {
             let mut filtered_entries = Vec::with_capacity(entries.len());
             for (entry, lock_count_modify) in &entries {
+                if !downstream.observed_range.contains_raw_key(&entry.key) {
+                    continue;
+                }
+
                 if *lock_count_modify != 0 && downstream.lock_heap.is_some() {
                     let lock_heap = downstream.lock_heap.as_mut().unwrap();
                     match lock_heap.entry(entry.start_ts.into()) {
@@ -950,7 +950,7 @@ impl Delegate {
                     }
                 }
 
-                if !downstream.observed_range.contains_raw_key(&entry.key)
+                if TxnSource::is_lossy_ddl_reorg_source_set(entry.txn_source)
                     || downstream.filter_loop
                         && TxnSource::is_cdc_write_source_set(entry.txn_source)
                 {
@@ -1057,9 +1057,14 @@ impl Delegate {
         match delete.cf.as_str() {
             "lock" => {
                 let key = Key::from_encoded(delete.take_key());
-                let row = rows.txns_by_key.get_mut(&key).unwrap();
-                assert_eq!(row.lock_count_modify, 0);
-                row.lock_count_modify = self.pop_lock(key)?;
+                let lock_count_modify = self.pop_lock(key.clone())?;
+                if lock_count_modify != 0 {
+                    // If lock_count_modify isn't 0 it means the deletion must come from a commit
+                    // or rollback, instead of any `Unlock` operations.
+                    let row = rows.txns_by_key.get_mut(&key).unwrap();
+                    assert_eq!(row.lock_count_modify, 0);
+                    row.lock_count_modify = lock_count_modify;
+                }
             }
             "" | "default" | "write" => {}
             other => panic!("invalid cf {}", other),
@@ -1428,7 +1433,7 @@ mod tests {
         let region_epoch = region.get_region_epoch().clone();
 
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (sink, mut drain) = crate::channel::channel(1, quota.clone());
+        let (sink, mut drain) = channel(ConnId::default(), 1, quota.clone());
         let rx = drain.drain();
         let request_id = RequestId(123);
         let mut downstream = Downstream::new(
@@ -1720,7 +1725,7 @@ mod tests {
         }
         assert_eq!(rows_builder.txns_by_key.len(), 5);
 
-        let (sink, mut drain) = channel(1, Arc::new(MemoryQuota::new(1024)));
+        let (sink, mut drain) = channel(ConnId::default(), 1, Arc::new(MemoryQuota::new(1024)));
         let mut downstream = Downstream::new(
             "peer".to_owned(),
             RegionEpoch::default(),
@@ -1787,7 +1792,7 @@ mod tests {
         }
         assert_eq!(rows_builder.txns_by_key.len(), 5);
 
-        let (sink, mut drain) = channel(1, Arc::new(MemoryQuota::new(1024)));
+        let (sink, mut drain) = channel(ConnId::default(), 1, Arc::new(MemoryQuota::new(1024)));
         let mut downstream = Downstream::new(
             "peer".to_owned(),
             RegionEpoch::default(),

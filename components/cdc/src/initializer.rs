@@ -101,6 +101,7 @@ pub(crate) struct Initializer<E> {
     pub(crate) observe_handle: ObserveHandle,
     pub(crate) downstream_id: DownstreamId,
     pub(crate) downstream_state: Arc<AtomicCell<DownstreamState>>,
+    pub(crate) scan_truncated: Arc<AtomicBool>,
 
     pub(crate) tablet: Option<E>,
     pub(crate) sched: Scheduler<Task>,
@@ -505,7 +506,11 @@ impl<E: KvEngine> Initializer<E> {
             events.push(CdcEvent::Barrier(Some(cb)));
             barrier = Some(fut);
         }
-        if let Err(e) = self.sink.send_all(events).await {
+        if let Err(e) = self
+            .sink
+            .send_all(events, self.scan_truncated.clone())
+            .await
+        {
             error!("cdc send scan event failed"; "req_id" => ?self.request_id);
             return Err(Error::Sink(e));
         }
@@ -702,7 +707,7 @@ mod tests {
     ) {
         let (receiver_worker, rx) = new_receiver_worker();
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (sink, drain) = crate::channel::channel(buffer, quota);
+        let (sink, drain) = crate::channel::channel(ConnId::default(), buffer, quota);
 
         let pool = Builder::new_multi_thread()
             .thread_name("test-initializer-worker")
@@ -723,6 +728,7 @@ mod tests {
             observe_handle: ObserveHandle::new(),
             downstream_id: DownstreamId::new(),
             downstream_state,
+            scan_truncated: Arc::new(Default::default()),
 
             tablet: engine.or_else(|| {
                 TestEngineBuilder::new()

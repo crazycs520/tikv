@@ -361,37 +361,46 @@ pub(crate) struct Advance {
 
     // To be compatible with old TiCDC client before v4.0.8.
     // TODO(qupeng): we can deprecate support for too old TiCDC clients.
-    // map[(ConnId, region_id)]->request_id.
-    pub(crate) dispersed: HashMap<(ConnId, u64), u64>,
+    // map[(ConnId, region_id)]->(request_id, ts).
+    pub(crate) compat: HashMap<(ConnId, u64), (RequestId, TimeStamp)>,
 
     pub(crate) scan_finished: usize,
 
     pub(crate) blocked_on_scan: usize,
 
     pub(crate) blocked_on_locks: usize,
+
+    min_resolved_ts: u64,
+    min_ts_region_id: u64,
 }
 
 impl Advance {
-    fn emit_resolved_ts(&mut self, connections: &HashMap<ConnId, Conn>) -> (u64, TimeStamp) {
-        let handle_send_result = |conn: &Conn, res: Result<(), SendError>| -> bool {
-            match res {
-                Ok(_) => return true,
-                Err(SendError::Disconnected) => {
-                    debug!("cdc send event failed, disconnected";
+    fn emit_resolved_ts(&mut self, connections: &HashMap<ConnId, Conn>) {
+        let handle_send_result = |conn: &Conn, res: Result<(), SendError>| match res {
+            Ok(_) => {}
+            Err(SendError::Disconnected) => {
+                debug!("cdc send event failed, disconnected";
                         "conn_id" => ?conn.get_id(), "downstream" => ?conn.get_peer());
-                }
-                Err(SendError::Full) | Err(SendError::Congested) => {
-                    info!("cdc send event failed, full";
-                        "conn_id" => ?conn.get_id(), "downstream" => ?conn.get_peer());
-                }
             }
-            false
+            Err(SendError::Full) | Err(SendError::Congested) => {
+                info!("cdc send event failed, full";
+                        "conn_id" => ?conn.get_id(), "downstream" => ?conn.get_peer());
+            }
         };
 
-        let send_cdc_events = |ts: u64, conn: &Conn, request_id: RequestId, regions: Vec<u64>| {
+        let mut batch_min_resolved_ts = 0;
+        let mut batch_min_ts_region_id = 0;
+        let mut batch_send = |ts: u64, conn: &Conn, req_id: RequestId, regions: Vec<u64>| {
+            if batch_min_resolved_ts == 0 || batch_min_resolved_ts > ts {
+                batch_min_resolved_ts = ts;
+                if !regions.is_empty() {
+                    batch_min_ts_region_id = regions[0];
+                }
+            }
+
             let mut resolved_ts = ResolvedTs::default();
             resolved_ts.ts = ts;
-            resolved_ts.request_id = request_id.0;
+            resolved_ts.request_id = req_id.0;
             *resolved_ts.mut_regions() = regions;
 
             let res = conn
@@ -400,23 +409,24 @@ impl Advance {
             handle_send_result(conn, res);
         };
 
-        let send_cdc_events_compact = |ts: u64, conn: &Conn, regions: HashSet<u64>| {
-            for region_id in regions {
-                let k = (conn.get_id(), region_id);
-                let request_id = self.dispersed.get(&k).unwrap();
-                let event = Event {
-                    region_id,
-                    request_id: *request_id,
-                    event: Some(Event_oneof_event::ResolvedTs(ts)),
-                    ..Default::default()
-                };
-                let res = conn
-                    .get_sink()
-                    .unbounded_send(CdcEvent::Event(event), false);
-                if handle_send_result(conn, res) {
-                    break;
-                }
+        let mut compat_min_resolved_ts = 0;
+        let mut compat_min_ts_region_id = 0;
+        let mut compat_send = |ts: u64, conn: &Conn, region_id: u64, req_id: RequestId| {
+            if compat_min_resolved_ts == 0 || compat_min_resolved_ts > ts {
+                compat_min_resolved_ts = ts;
+                compat_min_ts_region_id = region_id;
             }
+
+            let event = Event {
+                region_id,
+                request_id: req_id.0,
+                event: Some(Event_oneof_event::ResolvedTs(ts)),
+                ..Default::default()
+            };
+            let res = conn
+                .get_sink()
+                .unbounded_send(CdcEvent::Event(event), false);
+            handle_send_result(conn, res);
         };
 
         let multiplexing = std::mem::take(&mut self.multiplexing).into_iter();
@@ -425,25 +435,30 @@ impl Advance {
             .map(|((a, b), c)| (a, b, c))
             .chain(exclusive.map(|(a, c)| (a, RequestId(0), c)));
 
-        let mut min_resolved: Option<(u64, TimeStamp)> = None;
         for (conn_id, req_id, mut region_ts_heap) in unioned {
             let conn = connections.get(&conn_id).unwrap();
             let mut batch_count = 8;
             while !region_ts_heap.is_empty() {
                 let (ts, regions) = region_ts_heap.pop(batch_count);
-                if min_resolved.is_none() {
-                    let rid = regions.iter().next().map_or(0, |x| *x);
-                    min_resolved = Some((rid, ts));
-                }
                 if conn.features().contains(FeatureGate::BATCH_RESOLVED_TS) {
-                    send_cdc_events(ts.into_inner(), conn, req_id, Vec::from_iter(regions));
-                } else {
-                    send_cdc_events_compact(ts.into_inner(), conn, regions);
+                    batch_send(ts.into_inner(), conn, req_id, Vec::from_iter(regions));
                 }
                 batch_count *= 4;
             }
         }
-        min_resolved.unwrap_or_default()
+
+        for ((conn_id, region_id), (req_id, ts)) in std::mem::take(&mut self.compat) {
+            let conn = connections.get(&conn_id).unwrap();
+            compat_send(ts.into_inner(), conn, region_id, req_id);
+        }
+
+        if batch_min_resolved_ts > 0 {
+            self.min_resolved_ts = batch_min_resolved_ts;
+            self.min_ts_region_id = batch_min_ts_region_id;
+        } else {
+            self.min_resolved_ts = compat_min_resolved_ts;
+            self.min_ts_region_id = compat_min_ts_region_id;
+        }
     }
 }
 
@@ -837,8 +852,9 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             );
             // To avoid OOM (e.g., https://github.com/tikv/tikv/issues/16035),
             // TiKV needs to reject and return error immediately.
-            let _ = downstream
-                .sink_server_is_busy(region_id, "too many pending incremental scans".to_owned());
+            let mut err_event = EventError::default();
+            err_event.mut_server_is_busy().reason = "too many pending incremental scans".to_owned();
+            let _ = downstream.sink_error_event(region_id, err_event);
             return;
         }
 
@@ -846,7 +862,9 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             Some(reader) => reader.txn_extra_op.clone(),
             None => {
                 error!("cdc register for a not found region"; "region_id" => region_id);
-                let _ = downstream.sink_region_not_found(region_id);
+                let mut err_event = EventError::default();
+                err_event.mut_region_not_found().region_id = region_id;
+                let _ = downstream.sink_error_event(region_id, err_event);
                 return;
             }
         };
@@ -892,6 +910,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
         let observed_range = downstream.observed_range.clone();
         let downstream_state = downstream.get_state();
         let sched = self.scheduler.clone();
+        let scan_truncated = downstream.scan_truncated.clone();
 
         if let Err((err, downstream)) = delegate.subscribe(downstream) {
             let error_event = err.into_error_event(region_id);
@@ -927,6 +946,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
             observe_handle: delegate.handle.clone(),
             downstream_id,
             downstream_state,
+            scan_truncated,
 
             tablet: self.tablets.get(region_id).map(|t| t.into_owned()),
             sched,
@@ -1003,11 +1023,22 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
         locks: BTreeMap<Key, MiniLock>,
     ) {
         let region_id = region.get_id();
-        let mut deregisters = Vec::new();
-        if let Some(delegate) = self.capture_regions.get_mut(&region_id) {
-            if delegate.handle.id == observe_id {
+        match self.capture_regions.get_mut(&region_id) {
+            None => {
+                debug!("cdc region not found on region ready (finish scan locks)";
+                    "region_id" => region.get_id());
+            }
+            Some(delegate) => {
+                if delegate.handle.id != observe_id {
+                    debug!("cdc stale region ready";
+                        "region_id" => region.get_id(),
+                        "observe_id" => ?observe_id,
+                        "current_id" => ?delegate.handle.id);
+                    return;
+                }
                 match delegate.finish_scan_locks(region, locks) {
                     Ok(fails) => {
+                        let mut deregisters = Vec::new();
                         for (downstream, e) in fails {
                             deregisters.push(Deregister::Downstream {
                                 conn_id: downstream.conn_id,
@@ -1017,27 +1048,18 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
                                 err: Some(e),
                             });
                         }
+                        // Deregister downstreams if there is any downstream fails to subscribe.
+                        for deregister in deregisters {
+                            self.on_deregister(deregister);
+                        }
                     }
-                    Err(e) => deregisters.push(Deregister::Delegate {
+                    Err(e) => self.on_deregister(Deregister::Delegate {
                         region_id,
                         observe_id,
                         err: e,
                     }),
                 }
-            } else {
-                debug!("cdc stale region ready";
-                    "region_id" => region.get_id(),
-                    "observe_id" => ?observe_id,
-                    "current_id" => ?delegate.handle.id);
             }
-        } else {
-            debug!("cdc region not found on region ready (finish scan locks)";
-                "region_id" => region.get_id());
-        }
-
-        // Deregister downstreams if there is any downstream fails to subscribe.
-        for deregister in deregisters {
-            self.on_deregister(deregister);
         }
     }
 
@@ -1054,11 +1076,9 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
 
         self.resolved_region_count = advance.scan_finished;
         self.unresolved_region_count = advance.blocked_on_scan;
-        let (rid, ts) = advance.emit_resolved_ts(&self.connections);
-        if rid > 0 {
-            self.min_resolved_ts = ts;
-            self.min_ts_region_id = rid;
-        }
+        advance.emit_resolved_ts(&self.connections);
+        self.min_resolved_ts = advance.min_resolved_ts.into();
+        self.min_ts_region_id = advance.min_ts_region_id;
     }
 
     fn register_min_ts_event(&self, mut leader_resolver: LeadershipResolver, event_time: Instant) {
@@ -1118,7 +1138,7 @@ impl<T: 'static + CdcHandle<E>, E: KvEngine, S: StoreRegionMeta> Endpoint<T, E, 
                         Ok(_) | Err(ScheduleError::Stopped(_)) => (),
                         // Must schedule `RegisterMinTsEvent` event otherwise resolved ts can not
                         // advance normally.
-                        Err(err) => panic!("failed to regiester min ts event, error: {:?}", err),
+                        Err(err) => panic!("failed to register min ts event, error: {:?}", err),
                     }
                 } else {
                     // During shutdown, tso runtime drops future immediately,
@@ -1500,10 +1520,10 @@ mod tests {
         let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
         suite.add_region(1, 100);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
         suite.run(set_conn_version_task(
@@ -1780,14 +1800,14 @@ mod tests {
     #[test]
     fn test_raftstore_is_busy() {
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, _rx) = channel::channel(1, quota);
+        let (tx, _rx) = channel::channel(ConnId::default(), 1, quota);
         let mut suite = mock_endpoint(&CdcConfig::default(), None, ApiVersion::V1);
 
         // Fill the channel.
         suite.add_region(1 /* region id */, 1 /* cap */);
         suite.fill_raft_rx(1);
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
         suite.run(set_conn_version_task(
@@ -1835,10 +1855,10 @@ mod tests {
         let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
         suite.add_region(1, 100);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
 
@@ -1998,10 +2018,10 @@ mod tests {
 
         suite.add_region(1, 100);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
 
@@ -2101,11 +2121,11 @@ mod tests {
         suite.add_region(1, 100);
 
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
         let mut region = Region::default();
         region.set_id(1);
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
 
@@ -2197,11 +2217,11 @@ mod tests {
 
         // Register region 3 to another conn which is not support batch resolved ts.
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx2) = channel::channel(1, quota);
+        let (tx, mut rx2) = channel::channel(ConnId::default(), 1, quota);
         let mut rx2 = rx2.drain();
         let mut region = Region::default();
         region.set_id(3);
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
         suite.run(set_conn_version_task(
@@ -2274,10 +2294,10 @@ mod tests {
         let mut suite = mock_endpoint(&CdcConfig::default(), None, ApiVersion::V1);
         suite.add_region(1, 100);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
         suite.run(set_conn_version_task(
@@ -2427,9 +2447,9 @@ mod tests {
         let mut conn_rxs = vec![];
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
         for region_ids in [vec![1, 2], vec![3]] {
-            let (tx, rx) = channel::channel(1, quota.clone());
+            let (tx, rx) = channel::channel(ConnId::default(), 1, quota.clone());
             conn_rxs.push(rx);
-            let conn = Conn::new(tx, String::new());
+            let conn = Conn::new(ConnId::default(), tx, String::new());
             let conn_id = conn.get_id();
             suite.run(Task::OpenConn { conn });
             let version = FeatureGate::batch_resolved_ts();
@@ -2544,8 +2564,8 @@ mod tests {
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
 
         // Open conn a
-        let (tx1, _rx1) = channel::channel(1, quota.clone());
-        let conn_a = Conn::new(tx1, String::new());
+        let (tx1, _rx1) = channel::channel(ConnId::default(), 1, quota.clone());
+        let conn_a = Conn::new(ConnId::default(), tx1, String::new());
         let conn_id_a = conn_a.get_id();
         suite.run(Task::OpenConn { conn: conn_a });
         suite.run(set_conn_version_task(
@@ -2554,9 +2574,9 @@ mod tests {
         ));
 
         // Open conn b
-        let (tx2, mut rx2) = channel::channel(1, quota);
+        let (tx2, mut rx2) = channel::channel(ConnId::default(), 1, quota);
         let mut rx2 = rx2.drain();
-        let conn_b = Conn::new(tx2, String::new());
+        let conn_b = Conn::new(ConnId::default(), tx2, String::new());
         let conn_id_b = conn_b.get_id();
         suite.run(Task::OpenConn { conn: conn_b });
         suite.run(set_conn_version_task(
@@ -2702,10 +2722,10 @@ mod tests {
         };
         let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
         // Enable batch resolved ts in the test.
@@ -2799,10 +2819,10 @@ mod tests {
         let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
         suite.add_region(1, 100);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, mut rx) = channel::channel(1, quota);
+        let (tx, mut rx) = channel::channel(ConnId::default(), 1, quota);
         let mut rx = rx.drain();
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
 
@@ -3053,9 +3073,9 @@ mod tests {
         let mut suite = mock_endpoint(&cfg, None, ApiVersion::V1);
         suite.add_region(1, 100);
         let quota = Arc::new(MemoryQuota::new(usize::MAX));
-        let (tx, _rx) = channel::channel(1, quota);
+        let (tx, _rx) = channel::channel(ConnId::default(), 1, quota);
 
-        let conn = Conn::new(tx, String::new());
+        let conn = Conn::new(ConnId::default(), tx, String::new());
         let conn_id = conn.get_id();
         suite.run(Task::OpenConn { conn });
 
