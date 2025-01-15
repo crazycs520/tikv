@@ -702,7 +702,7 @@ impl<E: Engine> Endpoint<E> {
                         last_handle = Some(handle);
                         ranges_index_pointers.push(i);
                     } else {
-                        info!("index lookup not locate key"; "key" => ?key, "handle" => handle);
+                        // info!("index lookup not locate key"; "key" => ?key, "handle" => handle);
                         index_not_located_task.index_pointers.push(i);
                     }
                 }
@@ -894,7 +894,6 @@ impl<E: Engine> Endpoint<E> {
             for (i, task) in extra_tasks.iter().enumerate() {
                 if task.ranges.len() == 0 {
                     if task.index_pointers.len() > 0 {
-                        info!("index lookup not locate key, keep index"; "index_pointers" => ?task.index_pointers);
                         keep_index.extend_from_slice(&task.index_pointers);
                     }
                     continue;
