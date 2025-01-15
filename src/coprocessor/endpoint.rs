@@ -631,7 +631,6 @@ impl<E: Engine> Endpoint<E> {
                 }
                 keys.sort_by(|a, b| a.0.cmp(&b.0));
                 let mut ranges: Vec<coppb::KeyRange> = Vec::new();
-                let mut keep_indexes = Vec::new();
                 let mut last_region: Option<(Arc<metapb::Region>, u64, u64)> = None;
                 let mut extra_tasks = Vec::new();
                 fn add_point_range(
@@ -701,8 +700,7 @@ impl<E: Engine> Endpoint<E> {
                         last_handle = Some(handle);
                         ranges_index_pointers.push(i);
                     } else {
-                        // info!("index lookup not locate key"; "key" => ?key);
-                        keep_indexes.push(i);
+                        info!("index lookup not locate key"; "key" => ?key, "handle" => handle);
                         index_not_located_task.index_pointers.push(i);
                     }
                 }
@@ -891,9 +889,9 @@ impl<E: Engine> Endpoint<E> {
         let mut keep_index = Vec::new();
         let mut handle_extra_request_cost: f64 = 0.0;
         if sel.merge_from_bytes(resp.get_data()).is_ok() {
-            let begin = std::time::Instant::now();
             for (i, task) in extra_tasks.iter().enumerate() {
                 if task.ranges.len() == 0 {
+                    info!("index lookup not locate key, keep index"; "index_pointers" => ?task.index_pointers);
                     keep_index.extend_from_slice(&task.index_pointers);
                     continue;
                 }
