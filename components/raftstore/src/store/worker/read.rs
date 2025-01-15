@@ -3,7 +3,7 @@
 // #[PerformanceCriticalPath]
 use std::{
     cell::Cell,
-    collections::Bound::{Excluded, Included, Unbounded},
+    collections::Bound::{Excluded, Unbounded},
     fmt::{self, Display, Formatter},
     ops::Deref,
     sync::{
@@ -367,7 +367,7 @@ where
     fn locate_key(&self, key: &[u8]) -> Option<(Arc<metapb::Region>, u64, u64)> {
         match self.store_meta.lock() {
             Ok(meta) => {
-                let start = Included(data_key(key));
+                let start = Excluded(data_key(key));
                 let end = Unbounded::<Vec<u8>>;
                 for (_end_key, id) in meta.region_ranges.range((start, end)) {
                     if let Some(reader) = meta.readers.get(id) {
