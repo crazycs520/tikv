@@ -371,28 +371,29 @@ where
                 let end = start.clone();
                 for (_end_key, id) in meta.region_ranges.range((start, end)) {
                     if let Some(reader) = meta.readers.get(id) {
-                        let in_lease = reader.is_in_leader_lease(monotonic_raw_now());
-                        if in_lease && util::check_key_in_region(key, &reader.region).is_ok() {
-                            //     info!("locate key exist and valid";
-                            // "key" => ?key,
-                            // "end_key" => ?_end_key,
-                            // "region_start_key" => ?reader.region.start_key,
-                            // "region_end_key" => ?reader.region.end_key,
-                            // "region_id" => reader.region.id,
-                            // "term" => reader.term);
-                            return Some((reader.region.clone(), reader.peer_id, reader.term));
-                        } else {
-                            info!("locate key exist, but not valid";
-                            "key" => ?key,
-                            "end_key" => ?_end_key,
-                            "region_start_key" => ?reader.region.start_key,
-                            "region_end_key" => ?reader.region.end_key,
-                            "in_lease" => in_lease,
-                            "contain" => util::check_key_in_region(key,
-                            &reader.region).is_ok(),
-                            "region_id" => reader.region.id,
-                            "term" => reader.term);
-                        }
+                        return Some((reader.region.clone(), reader.peer_id, reader.term));
+                        // if util::check_key_in_region(key,
+                        // &reader.region).is_ok() {
+                        //     info!("locate key exist and valid";
+                        // "key" => ?key,
+                        // "end_key" => ?_end_key,
+                        // "region_start_key" => ?reader.region.start_key,
+                        // "region_end_key" => ?reader.region.end_key,
+                        // "region_id" => reader.region.id,
+                        // "term" => reader.term);
+                        // return Some((reader.region.clone(), reader.peer_id,
+                        // reader.term)); } else {
+                        // info!("locate key exist, but not valid";
+                        // "key" => ?key,
+                        // "end_key" => ?_end_key,
+                        // "region_start_key" => ?reader.region.start_key,
+                        // "region_end_key" => ?reader.region.end_key,
+                        // "in_lease" => in_lease,
+                        // "contain" => util::check_key_in_region(key,
+                        // &reader.region).is_ok(),
+                        // "region_id" => reader.region.id,
+                        // "term" => reader.term);
+                        // }
                     } else {
                         info!("locate key not exist"; "key" => ?key);
                     }
