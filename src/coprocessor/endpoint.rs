@@ -680,13 +680,15 @@ impl<E: Engine> Endpoint<E> {
                             last_handle = Some(handle);
                             continue;
                         } else {
-                            extra_tasks.push(ExtraExecutorTask {
-                                ranges: ranges.clone(),
-                                region: region.clone(),
-                                peer_id: *peer_id,
-                                term: *term,
-                                index_pointers: ranges_index_pointers.clone(),
-                            });
+                            if ranges.len() > 0 && ranges_index_pointers.len() > 0 {
+                                extra_tasks.push(ExtraExecutorTask {
+                                    ranges: ranges.clone(),
+                                    region: region.clone(),
+                                    peer_id: *peer_id,
+                                    term: *term,
+                                    index_pointers: ranges_index_pointers.clone(),
+                                });
+                            }
                             ranges.clear();
                             ranges_index_pointers.clear();
                         }
@@ -891,8 +893,10 @@ impl<E: Engine> Endpoint<E> {
         if sel.merge_from_bytes(resp.get_data()).is_ok() {
             for (i, task) in extra_tasks.iter().enumerate() {
                 if task.ranges.len() == 0 {
-                    info!("index lookup not locate key, keep index"; "index_pointers" => ?task.index_pointers);
-                    keep_index.extend_from_slice(&task.index_pointers);
+                    if task.index_pointers.len() > 0 {
+                        info!("index lookup not locate key, keep index"; "index_pointers" => ?task.index_pointers);
+                        keep_index.extend_from_slice(&task.index_pointers);
+                    }
                     continue;
                 }
                 let begin = std::time::Instant::now();
