@@ -563,7 +563,7 @@ impl<E: Engine> Endpoint<E> {
         schema: Vec<FieldType>,
         table_id: i64,
     ) -> Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>, Vec<FieldType>)> {
-        if sel.get_encode_type() == EncodeType::TypeChunk {
+        if sel.get_encode_type() == EncodeType::TypeChunk && schema.len() == 1 {
             let schema_types: Vec<_> = schema
                 .iter()
                 .map(|ft| {
