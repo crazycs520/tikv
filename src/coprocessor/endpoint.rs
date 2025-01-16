@@ -732,7 +732,7 @@ impl<E: Engine> Endpoint<E> {
                 extra_tasks.push(index_not_located_task);
                 let cost = begin.elapsed().as_secs_f64();
                 let count = extra_tasks.len();
-                info!("build extra executor range finish"; "cost" => cost, "tasks_count" => count);
+                info!("build extra executor range finish"; "cost" => cost, "tasks_count" => count, "schema_types.len()" => schema_types.len(), "schema.len" => schema.len());
                 return Some((extra_tasks, all_data, schema));
             }
         }
