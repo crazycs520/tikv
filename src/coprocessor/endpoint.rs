@@ -925,7 +925,7 @@ impl<E: Engine> Endpoint<E> {
                 let begin = std::time::Instant::now();
                 let extra_resp = result.await;
                 wait_extra_task_resp_cost += begin.elapsed().as_secs_f64();
-                // info!("get extra req resp"; "data.len" => extra_resp.data.len());
+                info!("get extra req resp"; "wait_extra_task_resp_cost" => begin.elapsed().as_secs_f64(), "total_wait" => wait_extra_task_resp_cost);
                 let mut extra_sel = SelectResponse::default();
                 if let Some(extra_resp) = extra_resp {
                     if extra_sel.merge_from_bytes(extra_resp.get_data()).is_ok() {
