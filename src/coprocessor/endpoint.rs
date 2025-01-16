@@ -909,7 +909,7 @@ impl<E: Engine> Endpoint<E> {
                     start_ts,
                 );
                 handle_extra_request_cost += begin.elapsed().as_secs_f64();
-                result_futures.push((i, range_result));
+                result_futures.push(range_result);
             }
         }
 
@@ -920,12 +920,10 @@ impl<E: Engine> Endpoint<E> {
                 return Ok(resp);
             }
             let mut total_chunks = sel.take_extra_chunks();
-            let mut wait_extra_task_resp_cost: f64 = 0.0;
-            for (i, result) in result_futures {
-                let begin = std::time::Instant::now();
-                let extra_resp = result.await;
-                wait_extra_task_resp_cost += begin.elapsed().as_secs_f64();
-                info!("get extra req resp"; "wait_extra_task_resp_cost" => begin.elapsed().as_secs_f64(), "total_wait" => wait_extra_task_resp_cost);
+            // let mut wait_extra_task_resp_cost: f64 = 0.0;
+            let batch_res: Vec<Option<MemoryTraceGuard<coppb::Response>>> =
+                futures::future::join_all(result_futures).await;
+            for (i, extra_resp) in batch_res.iter().enumerate() {
                 let mut extra_sel = SelectResponse::default();
                 if let Some(extra_resp) = extra_resp {
                     if extra_sel.merge_from_bytes(extra_resp.get_data()).is_ok() {
