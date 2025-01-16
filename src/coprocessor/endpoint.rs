@@ -563,6 +563,7 @@ impl<E: Engine> Endpoint<E> {
         schema: Vec<FieldType>,
         table_id: i64,
     ) -> Option<(Vec<ExtraExecutorTask>, Vec<Vec<Datum>>, Vec<FieldType>)> {
+        let begin = std::time::Instant::now();
         if sel.get_encode_type() == EncodeType::TypeChunk {
             let schema_types: Vec<_> = schema
                 .iter()
@@ -729,6 +730,9 @@ impl<E: Engine> Endpoint<E> {
                     }
                 }
                 extra_tasks.push(index_not_located_task);
+                let cost = begin.elapsed().as_secs_f64();
+                let count = extra_tasks.len();
+                info!("build extra executor range finish"; "cost" => cost, "tasks_count" => count);
                 return Some((extra_tasks, all_data, schema));
             }
         }
@@ -931,9 +935,11 @@ impl<E: Engine> Endpoint<E> {
                 return Ok(resp);
             }
             let mut total_chunks = sel.take_extra_chunks();
-            // let mut wait_extra_task_resp_cost: f64 = 0.0;
+            let begin = std::time::Instant::now();
             let batch_res: Vec<Option<MemoryTraceGuard<coppb::Response>>> =
                 futures::future::join_all(result_futures).await;
+            let wait_extra_task_resp_cost = begin.elapsed().as_secs_f64();
+            info!("wait extra task resp cost"; "build" => handle_extra_request_cost,  "wait_extra_task_resp_cost" => wait_extra_task_resp_cost);
             for (i, extra_resp) in batch_res.iter().enumerate() {
                 let mut extra_sel = SelectResponse::default();
                 if let Some(extra_resp) = extra_resp {
