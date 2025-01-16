@@ -601,7 +601,18 @@ impl<E: Engine> Endpoint<E> {
                 for i in 0..len {
                     let mut dt = Vec::new();
                     for (j, ft) in schema.iter().enumerate() {
-                        dt.push(columns[j].get_datum(i, ft).expect("fail to get datum"));
+                        let v = match columns[j].get_datum(i, ft) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                info!("get datum error"; "err" => ?e, 
+                                    "schema" => ?schema, 
+                                    "j" =>j, 
+                                    "i" => i, 
+                                    "ft" => ?ft);
+                                return None;
+                            }
+                        };
+                        dt.push(v);
                     }
                     all_data.push(dt);
                 }
